@@ -1656,67 +1656,135 @@ const mlFlightLayer = {
   renderingMode: '3d',
 
   _map: null, _gl: null,
-  _program: null, _uMatrix: null, _uColor: null, _aPos: null,
-  _buffers: [],
+  _linePrg: null, _pointPrg: null,
+  _lineLoc: null, _pointLoc: null,
+  _buffers: [],   // [{posBuf, colorBuf, count}]
 
   onAdd(map, gl) {
     this._map = map;
     this._gl  = gl;
 
-    const vs = `
+    // ── 線用シェーダ（頂点色対応） ──
+    const vsLine = `
       attribute vec3 a_pos;
+      attribute vec3 a_color;
       uniform mat4 u_matrix;
+      varying vec3 v_color;
       void main() {
+        v_color = a_color;
         gl_Position = u_matrix * vec4(a_pos, 1.0);
-      }
-    `;
-    const fs = `
+      }`;
+    const fsLine = `
       precision mediump float;
-      uniform vec4 u_color;
-      void main() { gl_FragColor = u_color; }
-    `;
-    const vss = gl.createShader(gl.VERTEX_SHADER);
-    gl.shaderSource(vss, vs); gl.compileShader(vss);
-    const fss = gl.createShader(gl.FRAGMENT_SHADER);
-    gl.shaderSource(fss, fs); gl.compileShader(fss);
-    this._program = gl.createProgram();
-    gl.attachShader(this._program, vss);
-    gl.attachShader(this._program, fss);
-    gl.linkProgram(this._program);
+      varying vec3 v_color;
+      void main() { gl_FragColor = vec4(v_color, 1.0); }`;
 
-    this._aPos    = gl.getAttribLocation(this._program, 'a_pos');
-    this._uMatrix = gl.getUniformLocation(this._program, 'u_matrix');
-    this._uColor  = gl.getUniformLocation(this._program, 'u_color');
+    // ── 点用シェーダ（円形・サイズ可変・頂点色対応） ──
+    const vsPoint = `
+      attribute vec3 a_pos;
+      attribute vec3 a_color;
+      uniform mat4 u_matrix;
+      uniform float u_size;
+      varying vec3 v_color;
+      void main() {
+        v_color = a_color;
+        gl_Position = u_matrix * vec4(a_pos, 1.0);
+        gl_PointSize = u_size;
+      }`;
+    const fsPoint = `
+      precision mediump float;
+      varying vec3 v_color;
+      void main() {
+        vec2 c = gl_PointCoord - vec2(0.5);
+        float d = length(c);
+        if (d > 0.5) discard;
+        float a = smoothstep(0.5, 0.42, d);
+        gl_FragColor = vec4(v_color, a);
+      }`;
+
+    const compile = (vsSrc, fsSrc) => {
+      const vs = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vs, vsSrc); gl.compileShader(vs);
+      const fs = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fs, fsSrc); gl.compileShader(fs);
+      const prg = gl.createProgram();
+      gl.attachShader(prg, vs); gl.attachShader(prg, fs);
+      gl.linkProgram(prg);
+      return prg;
+    };
+
+    this._linePrg  = compile(vsLine,  fsLine);
+    this._pointPrg = compile(vsPoint, fsPoint);
+
+    this._lineLoc = {
+      aPos:    gl.getAttribLocation(this._linePrg, 'a_pos'),
+      aColor:  gl.getAttribLocation(this._linePrg, 'a_color'),
+      uMatrix: gl.getUniformLocation(this._linePrg, 'u_matrix')
+    };
+    this._pointLoc = {
+      aPos:    gl.getAttribLocation(this._pointPrg, 'a_pos'),
+      aColor:  gl.getAttribLocation(this._pointPrg, 'a_color'),
+      uMatrix: gl.getUniformLocation(this._pointPrg, 'u_matrix'),
+      uSize:   gl.getUniformLocation(this._pointPrg, 'u_size')
+    };
 
     this._buildBuffers();
   },
 
   onRemove() {
     this._destroyBuffers();
-    if (this._gl && this._program) {
-      this._gl.deleteProgram(this._program);
-      this._program = null;
+    if (this._gl) {
+      if (this._linePrg)  this._gl.deleteProgram(this._linePrg);
+      if (this._pointPrg) this._gl.deleteProgram(this._pointPrg);
     }
-    this._gl = null; this._map = null;
+    this._linePrg = null; this._pointPrg = null; this._gl = null; this._map = null;
   },
 
   render(gl, matrix) {
-    if (!this._program || !this._buffers.length) return;
-    gl.useProgram(this._program);
-    gl.uniformMatrix4fv(this._uMatrix, false, matrix);
+    if (!this._buffers.length) return;
+
+    const s = getSettings();
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.enableVertexAttribArray(this._aPos);
+    try { gl.lineWidth(2.0); } catch(e) {}
+
+    // ── ライン描画 (LINE_STRIP) ──
+    gl.useProgram(this._linePrg);
+    gl.uniformMatrix4fv(this._lineLoc.uMatrix, false, matrix);
     this._buffers.forEach(b => {
-      gl.bindBuffer(gl.ARRAY_BUFFER, b.buffer);
-      gl.vertexAttribPointer(this._aPos, 3, gl.FLOAT, false, 0, 0);
-      gl.uniform4fv(this._uColor, b.color);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.posBuf);
+      gl.enableVertexAttribArray(this._lineLoc.aPos);
+      gl.vertexAttribPointer(this._lineLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.colorBuf);
+      gl.enableVertexAttribArray(this._lineLoc.aColor);
+      gl.vertexAttribPointer(this._lineLoc.aColor, 3, gl.FLOAT, false, 0, 0);
       gl.drawArrays(gl.LINE_STRIP, 0, b.count);
+    });
+
+    // ── ポイント描画 (POINTS、円形、pointScale 連動) ──
+    const dpr = window.devicePixelRatio || 1;
+    const pointSize = Math.max(2, 4.5 * s.pointScale) * dpr;
+    gl.useProgram(this._pointPrg);
+    gl.uniformMatrix4fv(this._pointLoc.uMatrix, false, matrix);
+    gl.uniform1f(this._pointLoc.uSize, pointSize);
+    this._buffers.forEach(b => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.posBuf);
+      gl.enableVertexAttribArray(this._pointLoc.aPos);
+      gl.vertexAttribPointer(this._pointLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.colorBuf);
+      gl.enableVertexAttribArray(this._pointLoc.aColor);
+      gl.vertexAttribPointer(this._pointLoc.aColor, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.POINTS, 0, b.count);
     });
   },
 
   _destroyBuffers() {
-    if (this._gl) this._buffers.forEach(b => this._gl.deleteBuffer(b.buffer));
+    if (this._gl) {
+      this._buffers.forEach(b => {
+        this._gl.deleteBuffer(b.posBuf);
+        this._gl.deleteBuffer(b.colorBuf);
+      });
+    }
     this._buffers = [];
   },
 
@@ -1724,7 +1792,9 @@ const mlFlightLayer = {
     this._destroyBuffers();
     if (!this._gl || !allPts.length || !files.length) return;
     const gl = this._gl;
-    const altScale = getSettings().altScale;
+    const s = getSettings();
+    const useAltColor = s.colorMode === 'altitude';
+    const maxAlt = Math.max(0.0001, Math.max(...allPts.map(p => p.alt)) * s.altScale);
 
     files.forEach(f => {
       const pts = allPts.filter(p => p.fileId === f.id);
@@ -1732,29 +1802,46 @@ const mlFlightLayer = {
       const baseElev = f._takeoffElevMSL || 0;
 
       const pos = new Float32Array(pts.length * 3);
+      const col = new Float32Array(pts.length * 3);
+
+      // ファイル色（fallback）
+      const hex = (f.color || '#22d3ee').replace('#', '');
+      const fr = parseInt(hex.substr(0,2), 16) / 255;
+      const fg = parseInt(hex.substr(2,2), 16) / 255;
+      const fb = parseInt(hex.substr(4,2), 16) / 255;
+
       pts.forEach((p, i) => {
+        const altMSL = (baseElev + p.alt) * s.altScale;
         const mc = maplibregl.MercatorCoordinate.fromLngLat(
-          { lng: p.lon, lat: p.lat },
-          (baseElev + p.alt) * altScale
+          { lng: p.lon, lat: p.lat }, altMSL
         );
         pos[i*3]   = mc.x;
         pos[i*3+1] = mc.y;
         pos[i*3+2] = mc.z;
+
+        if (useAltColor && s.colorLow && s.colorHigh) {
+          const t = Math.max(0, Math.min(1, (p.alt * s.altScale) / maxAlt));
+          col[i*3]   = s.colorLow.r + (s.colorHigh.r - s.colorLow.r) * t;
+          col[i*3+1] = s.colorLow.g + (s.colorHigh.g - s.colorLow.g) * t;
+          col[i*3+2] = s.colorLow.b + (s.colorHigh.b - s.colorLow.b) * t;
+        } else {
+          col[i*3] = fr; col[i*3+1] = fg; col[i*3+2] = fb;
+        }
       });
 
-      const buf = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      const posBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
       gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
 
-      const hex = (f.color || '#22d3ee').replace('#', '');
-      const r = parseInt(hex.substr(0,2), 16) / 255;
-      const g = parseInt(hex.substr(2,2), 16) / 255;
-      const b = parseInt(hex.substr(4,2), 16) / 255;
-      this._buffers.push({ buffer: buf, count: pts.length, color: [r, g, b, 1.0] });
+      const colorBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+
+      this._buffers.push({ posBuf, colorBuf, count: pts.length });
     });
   },
 
-  /** altScale 変更時など buffer を作り直したい時に呼ぶ */
+  /** altScale / colorMode / colorLow/High 変更時に再構築 */
   refresh() {
     if (!this._gl) return;
     this._buildBuffers();
@@ -1777,7 +1864,11 @@ function ensureFlightLayer() {
 function ensureShadowAndMarkers() {
   if (!maplibreMap || !maplibreMap.isStyleLoaded()) return;
 
-  // 地表トレースライン (破線) と マーカー の GeoJSON 構築
+  const s = getSettings();
+  const markerR = Math.max(3, 12 * s.markerScale);   // markerScale 反映 (px)
+  const haloR   = markerR * 1.7;
+
+  // GeoJSON 構築
   const shadowFeatures = [], markerFeatures = [];
   files.forEach(f => {
     const pts = allPts.filter(p => p.fileId === f.id);
@@ -1802,40 +1893,47 @@ function ensureShadowAndMarkers() {
   const shadowGJ = { type: 'FeatureCollection', features: shadowFeatures };
   const markerGJ = { type: 'FeatureCollection', features: markerFeatures };
 
-  // Shadow
+  // Shadow line（showShadow チェック対応）
   if (maplibreMap.getSource('ml-shadow')) {
     maplibreMap.getSource('ml-shadow').setData(shadowGJ);
   } else {
     maplibreMap.addSource('ml-shadow', { type: 'geojson', data: shadowGJ });
     maplibreMap.addLayer({
       id: 'ml-shadow-line', type: 'line', source: 'ml-shadow',
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: {
-        'line-color': ['get', 'color'], 'line-width': 1.5,
-        'line-opacity': 0.5, 'line-dasharray': [3, 3]
-      }
+      layout: { 'line-cap': 'round', 'line-join': 'round',
+                'visibility': s.showShadow ? 'visible' : 'none' },
+      paint: { 'line-color': ['get', 'color'], 'line-width': 1.5,
+               'line-opacity': 0.5, 'line-dasharray': [3, 3] }
     });
   }
+  if (maplibreMap.getLayer('ml-shadow-line')) {
+    maplibreMap.setLayoutProperty('ml-shadow-line', 'visibility',
+      s.showShadow ? 'visible' : 'none');
+  }
 
-  // Markers
+  // Markers (markerScale 反映)
   if (maplibreMap.getSource('ml-markers')) {
     maplibreMap.getSource('ml-markers').setData(markerGJ);
   } else {
     maplibreMap.addSource('ml-markers', { type: 'geojson', data: markerGJ });
     maplibreMap.addLayer({
       id: 'ml-marker-halo', type: 'circle', source: 'ml-markers',
-      paint: { 'circle-radius': 14, 'circle-color': ['get', 'color'], 'circle-opacity': 0.2 }
+      paint: { 'circle-radius': haloR, 'circle-color': ['get', 'color'], 'circle-opacity': 0.2 }
     });
     maplibreMap.addLayer({
       id: 'ml-marker-main', type: 'circle', source: 'ml-markers',
-      paint: {
-        'circle-radius': 8, 'circle-color': ['get', 'color'],
-        'circle-stroke-color': '#fff', 'circle-stroke-width': 2
-      }
+      paint: { 'circle-radius': markerR, 'circle-color': ['get', 'color'],
+               'circle-stroke-color': '#fff', 'circle-stroke-width': 2 }
     });
   }
+  // 半径を最新の markerScale に同期
+  if (maplibreMap.getLayer('ml-marker-halo')) {
+    maplibreMap.setPaintProperty('ml-marker-halo', 'circle-radius', haloR);
+  }
+  if (maplibreMap.getLayer('ml-marker-main')) {
+    maplibreMap.setPaintProperty('ml-marker-main', 'circle-radius', markerR);
+  }
 }
-
 
 function initMapLibre() {
   return new Promise(resolve => {
@@ -1962,15 +2060,19 @@ async function updateTerrain3D() {
 
   try { maplibreMap.setTerrain({ source: 'terrain-dem', exaggeration: altScale }); } catch(e) {}
 
-  // フライトエリアにフィット（moveend を待って確実に完了させる）
+  // フライトエリアにフィット（moveend が発火しないケースに備えてタイムアウト併用）
   const lons = allPts.map(p => p.lon), lats = allPts.map(p => p.lat);
-  await new Promise(res => {
-    maplibreMap.once('moveend', res);
-    maplibreMap.fitBounds(
-      [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]],
-      { padding: 80, pitch: 40, bearing: 0, duration: 800, maxZoom: 15 }
-    );
-  });
+  let moveResolved = false;
+  await Promise.race([
+    new Promise(res => {
+      maplibreMap.once('moveend', () => { moveResolved = true; res(); });
+      maplibreMap.fitBounds(
+        [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]],
+        { padding: 80, pitch: 40, bearing: 0, duration: 800, maxZoom: 15 }
+      );
+    }),
+    new Promise(res => setTimeout(res, 1500))   // 1.5s タイムアウト（ハング防止）
+  ]);
   if (myEpoch !== mlEpoch) return;
 
   // 地形タイル読み込みを待つ
@@ -1989,12 +2091,34 @@ async function updateTerrain3D() {
     f._refRelAlt = minPt.alt;
   }
 
+  // ★★★ 地図が idle 状態（タイル読み込み・レンダ完了）になるまで待機 ★★★
+  // これがないと addLayer 直後の render() がスキップされ、
+  // スライダー操作（idle 状態で発生）で初めて表示される現象が起きる
+  await Promise.race([
+    new Promise(res => {
+      if (maplibreMap.loaded() && !maplibreMap.isMoving()) res();
+      else maplibreMap.once('idle', res);
+    }),
+    new Promise(res => setTimeout(res, 2000))   // ハング防止
+  ]);
+  if (myEpoch !== mlEpoch) return;
+
   // 3D ライン (WebGL カスタムレイヤー) + 地表トレース + マーカー
   ensureFlightLayer();
   ensureShadowAndMarkers();
+  mlFlightLayer.refresh();
   maplibreMap.triggerRepaint();
 
   updateTerrainPanel(altScale);
+
+  // セーフティネット: 次の idle で再度 refresh（addLayer が引き起こす busy 状態対策）
+  maplibreMap.once('idle', () => {
+    if (currentView !== 'terrain' || myEpoch !== mlEpoch) return;
+    if (!maplibreMap.getLayer || !maplibreMap.getLayer('ml-flight-3d')) return;
+    mlFlightLayer.refresh();
+    ensureShadowAndMarkers();
+    maplibreMap.triggerRepaint();
+  });
 }
 
 
@@ -2151,7 +2275,8 @@ function applySettings() {
   if (allPts.length && maplibreMap && maplibreMap.getLayer && maplibreMap.getLayer('ml-flight-3d')) {
     const altScale = getSettings().altScale;
     try { maplibreMap.setTerrain({ source: 'terrain-dem', exaggeration: altScale }); } catch(e) {}
-    mlFlightLayer.refresh();         // WebGL buffer を新しい altScale で再構築
+    mlFlightLayer.refresh();          // 高度・色を最新設定で再構築
+    ensureShadowAndMarkers();         // マーカー径・shadow 表示を最新設定で反映
     updateTerrainPanel(altScale);
     maplibreMap.triggerRepaint();
   } else if (allPts.length && currentView === 'terrain') {

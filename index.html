@@ -1521,12 +1521,15 @@ let leafletLayerObj = null;
 let leafletPolylines = [];
 let leafletMarkers = [];
 
-// ===== 地形3D (MapLibre GL JS + Canvas 2D Overlay) =====
-let maplibreMap     = null;
-let mlCanvas        = null;   // 飛行経路描画用 2D Canvas
-let mlRenderHandler = null;   // maplibreMap.on('render', handler) の参照
-let mlDragState     = { active: false, button: -1, x: 0, y: 0 };
-let mlEpoch         = 0;      // 並行 updateTerrain3D をキャンセルするエポック
+// ===== 地形3D (MapLibre GL JS + 公式 raw WebGL カスタムレイヤー) =====
+//  vertex shader  : gl_Position = u_matrix * vec4(a_pos, 1.0)
+//  a_pos          : Mercator座標 (x, y, z=altitude_in_mercator_units)
+//  u_matrix       : MapLibre が render(gl, matrix) で渡す MVP 行列
+//  これは MapLibre 自身の fill-extrusion レイヤーと同じ方式。
+//  CPU 側で行列計算を一切行わないため形式・精度問題が起こらない。
+let maplibreMap = null;
+let mlDragState = { active: false, button: -1, x: 0, y: 0 };
+let mlEpoch     = 0;
 
 function initLeaflet() {
   if (leafletMap) return;
@@ -1643,109 +1646,193 @@ async function queryTerrainElevPoint(lon, lat, maxWait = 4000) {
  * 3D点 (lon, lat, altMSL) をスクリーン座標に投影
  * matrix: MapLibre が render() に渡す MVP 行列配列 (column-major, 16要素)
  */
-/**
- * 飛行経路を Canvas 2D に描画
- * maplibreMap.project([lon,lat]) でスクリーン座標を取得（地形に追従）
- * render イベントごとに呼ばれるため、カメラ移動に自動追従する
- */
-function drawMLFlightSimple() {
-  if (!mlCanvas || currentView !== 'terrain' || !allPts.length || !files.length) return;
 
-  const container = maplibreMap.getContainer();
-  const W = container.offsetWidth;
-  const H = container.offsetHeight;
-  if (!W || !H) return;
+// ----------------------------------------------------------------
+//  飛行経路 3D ライン用 WebGL カスタムレイヤー（公式パターン）
+// ----------------------------------------------------------------
+const mlFlightLayer = {
+  id: 'ml-flight-3d',
+  type: 'custom',
+  renderingMode: '3d',
 
-  if (mlCanvas.width !== W || mlCanvas.height !== H) {
-    mlCanvas.width  = W;
-    mlCanvas.height = H;
+  _map: null, _gl: null,
+  _program: null, _uMatrix: null, _uColor: null, _aPos: null,
+  _buffers: [],
+
+  onAdd(map, gl) {
+    this._map = map;
+    this._gl  = gl;
+
+    const vs = `
+      attribute vec3 a_pos;
+      uniform mat4 u_matrix;
+      void main() {
+        gl_Position = u_matrix * vec4(a_pos, 1.0);
+      }
+    `;
+    const fs = `
+      precision mediump float;
+      uniform vec4 u_color;
+      void main() { gl_FragColor = u_color; }
+    `;
+    const vss = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vss, vs); gl.compileShader(vss);
+    const fss = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fss, fs); gl.compileShader(fss);
+    this._program = gl.createProgram();
+    gl.attachShader(this._program, vss);
+    gl.attachShader(this._program, fss);
+    gl.linkProgram(this._program);
+
+    this._aPos    = gl.getAttribLocation(this._program, 'a_pos');
+    this._uMatrix = gl.getUniformLocation(this._program, 'u_matrix');
+    this._uColor  = gl.getUniformLocation(this._program, 'u_color');
+
+    this._buildBuffers();
+  },
+
+  onRemove() {
+    this._destroyBuffers();
+    if (this._gl && this._program) {
+      this._gl.deleteProgram(this._program);
+      this._program = null;
+    }
+    this._gl = null; this._map = null;
+  },
+
+  render(gl, matrix) {
+    if (!this._program || !this._buffers.length) return;
+    gl.useProgram(this._program);
+    gl.uniformMatrix4fv(this._uMatrix, false, matrix);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enableVertexAttribArray(this._aPos);
+    this._buffers.forEach(b => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.buffer);
+      gl.vertexAttribPointer(this._aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.uniform4fv(this._uColor, b.color);
+      gl.drawArrays(gl.LINE_STRIP, 0, b.count);
+    });
+  },
+
+  _destroyBuffers() {
+    if (this._gl) this._buffers.forEach(b => this._gl.deleteBuffer(b.buffer));
+    this._buffers = [];
+  },
+
+  _buildBuffers() {
+    this._destroyBuffers();
+    if (!this._gl || !allPts.length || !files.length) return;
+    const gl = this._gl;
+    const altScale = getSettings().altScale;
+
+    files.forEach(f => {
+      const pts = allPts.filter(p => p.fileId === f.id);
+      if (pts.length < 2) return;
+      const baseElev = f._takeoffElevMSL || 0;
+
+      const pos = new Float32Array(pts.length * 3);
+      pts.forEach((p, i) => {
+        const mc = maplibregl.MercatorCoordinate.fromLngLat(
+          { lng: p.lon, lat: p.lat },
+          (baseElev + p.alt) * altScale
+        );
+        pos[i*3]   = mc.x;
+        pos[i*3+1] = mc.y;
+        pos[i*3+2] = mc.z;
+      });
+
+      const buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+
+      const hex = (f.color || '#22d3ee').replace('#', '');
+      const r = parseInt(hex.substr(0,2), 16) / 255;
+      const g = parseInt(hex.substr(2,2), 16) / 255;
+      const b = parseInt(hex.substr(4,2), 16) / 255;
+      this._buffers.push({ buffer: buf, count: pts.length, color: [r, g, b, 1.0] });
+    });
+  },
+
+  /** altScale 変更時など buffer を作り直したい時に呼ぶ */
+  refresh() {
+    if (!this._gl) return;
+    this._buildBuffers();
+    if (this._map) this._map.triggerRepaint();
   }
+};
 
-  const ctx = mlCanvas.getContext('2d');
-  ctx.clearRect(0, 0, W, H);
+// ----------------------------------------------------------------
+//  shadow (地表トレース) と markers (開始終了) は MapLibre ネイティブ
+// ----------------------------------------------------------------
+function ensureFlightLayer() {
+  if (!maplibreMap || !maplibreMap.isStyleLoaded()) return;
+  if (!maplibreMap.getLayer('ml-flight-3d')) {
+    maplibreMap.addLayer(mlFlightLayer);
+  } else {
+    mlFlightLayer.refresh();
+  }
+}
 
-  const altScale = getSettings().altScale;
+function ensureShadowAndMarkers() {
+  if (!maplibreMap || !maplibreMap.isStyleLoaded()) return;
 
+  // 地表トレースライン (破線) と マーカー の GeoJSON 構築
+  const shadowFeatures = [], markerFeatures = [];
   files.forEach(f => {
     const pts = allPts.filter(p => p.fileId === f.id);
     if (pts.length < 2) return;
-
-    // ── 影ライン（破線・地表トレース）──
-    ctx.save();
-    ctx.strokeStyle = f.color;
-    ctx.lineWidth   = 1.5;
-    ctx.setLineDash([5, 4]);
-    ctx.globalAlpha = 0.5;
-    ctx.beginPath();
-    let moved = false;
-    pts.forEach(p => {
-      const px = maplibreMap.project([p.lon, p.lat]);
-      moved ? ctx.lineTo(px.x, px.y) : (ctx.moveTo(px.x, px.y), moved = true);
+    shadowFeatures.push({
+      type: 'Feature',
+      properties: { color: f.color },
+      geometry: { type: 'LineString', coordinates: pts.map(p => [p.lon, p.lat]) }
     });
-    ctx.stroke();
-    ctx.restore();
-
-    // ── メイン経路ライン（実線）──
-    ctx.save();
-    ctx.strokeStyle = f.color;
-    ctx.lineWidth   = 2.5;
-    ctx.lineJoin    = 'round';
-    ctx.lineCap     = 'round';
-    ctx.beginPath();
-    moved = false;
-    pts.forEach(p => {
-      const px = maplibreMap.project([p.lon, p.lat]);
-      moved ? ctx.lineTo(px.x, px.y) : (ctx.moveTo(px.x, px.y), moved = true);
-    });
-    ctx.stroke();
-    ctx.restore();
-
-    // ── 開始(緑)・終了(赤) マーカー ──
-    const mkColors = ['#22c55e', '#ef4444'];
-    [pts[0], pts[pts.length - 1]].forEach((pt, i) => {
-      const px = maplibreMap.project([pt.lon, pt.lat]);
-      ctx.save();
-      // ハロー
-      ctx.beginPath(); ctx.arc(px.x, px.y, 14, 0, Math.PI * 2);
-      ctx.fillStyle = mkColors[i]; ctx.globalAlpha = 0.2; ctx.fill();
-      // 本体
-      ctx.globalAlpha = 1;
-      ctx.beginPath(); ctx.arc(px.x, px.y, 8, 0, Math.PI * 2);
-      ctx.fillStyle = mkColors[i]; ctx.fill();
-      ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.stroke();
-      ctx.restore();
+    [
+      { pt: pts[0],              color: '#22c55e', label: '開始' },
+      { pt: pts[pts.length - 1], color: '#ef4444', label: '終了' }
+    ].forEach(({ pt, color, label }) => {
+      markerFeatures.push({
+        type: 'Feature',
+        properties: { color, label, alt: pt.alt.toFixed(1) },
+        geometry: { type: 'Point', coordinates: [pt.lon, pt.lat] }
+      });
     });
   });
-}
 
-/** Canvas を 1 枚だけ作成（重複防止） */
-function ensureMLCanvas() {
-  if (mlCanvas && mlCanvas.parentNode) return;
-  const container = maplibreMap.getContainer();
-  if (!mlCanvas) {
-    mlCanvas = document.createElement('canvas');
-    mlCanvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:200;';
+  const shadowGJ = { type: 'FeatureCollection', features: shadowFeatures };
+  const markerGJ = { type: 'FeatureCollection', features: markerFeatures };
+
+  // Shadow
+  if (maplibreMap.getSource('ml-shadow')) {
+    maplibreMap.getSource('ml-shadow').setData(shadowGJ);
+  } else {
+    maplibreMap.addSource('ml-shadow', { type: 'geojson', data: shadowGJ });
+    maplibreMap.addLayer({
+      id: 'ml-shadow-line', type: 'line', source: 'ml-shadow',
+      layout: { 'line-cap': 'round', 'line-join': 'round' },
+      paint: {
+        'line-color': ['get', 'color'], 'line-width': 1.5,
+        'line-opacity': 0.5, 'line-dasharray': [3, 3]
+      }
+    });
   }
-  container.appendChild(mlCanvas);
-}
 
-/** render イベントリスナーを開始（既存は先に削除） */
-function startMLRendering() {
-  stopMLRendering();
-  mlRenderHandler = () => drawMLFlightSimple();
-  maplibreMap.on('render', mlRenderHandler);
-  maplibreMap.triggerRepaint();
-}
-
-/** render イベントリスナーを停止し Canvas をクリア */
-function stopMLRendering() {
-  if (mlRenderHandler && maplibreMap) {
-    maplibreMap.off('render', mlRenderHandler);
-    mlRenderHandler = null;
-  }
-  if (mlCanvas) {
-    const ctx = mlCanvas.getContext('2d');
-    ctx.clearRect(0, 0, mlCanvas.width, mlCanvas.height);
+  // Markers
+  if (maplibreMap.getSource('ml-markers')) {
+    maplibreMap.getSource('ml-markers').setData(markerGJ);
+  } else {
+    maplibreMap.addSource('ml-markers', { type: 'geojson', data: markerGJ });
+    maplibreMap.addLayer({
+      id: 'ml-marker-halo', type: 'circle', source: 'ml-markers',
+      paint: { 'circle-radius': 14, 'circle-color': ['get', 'color'], 'circle-opacity': 0.2 }
+    });
+    maplibreMap.addLayer({
+      id: 'ml-marker-main', type: 'circle', source: 'ml-markers',
+      paint: {
+        'circle-radius': 8, 'circle-color': ['get', 'color'],
+        'circle-stroke-color': '#fff', 'circle-stroke-width': 2
+      }
+    });
   }
 }
 
@@ -1902,9 +1989,10 @@ async function updateTerrain3D() {
     f._refRelAlt = minPt.alt;
   }
 
-  // Canvas を作成し render イベントで継続描画開始
-  ensureMLCanvas();
-  startMLRendering();   // ← render イベントで drawMLFlightSimple() が毎フレーム呼ばれる
+  // 3D ライン (WebGL カスタムレイヤー) + 地表トレース + マーカー
+  ensureFlightLayer();
+  ensureShadowAndMarkers();
+  maplibreMap.triggerRepaint();
 
   updateTerrainPanel(altScale);
 }
@@ -1912,8 +2000,9 @@ async function updateTerrain3D() {
 
 function switchMapLibreLayer(layerKey) {
   if (!maplibreMap) return;
-  mlEpoch++;           // 実行中の updateTerrain3D をキャンセル
-  stopMLRendering();   // render ハンドラを停止
+  mlEpoch++;
+  // setStyle で全レイヤー（カスタムレイヤー含む）が削除されるため
+  // 標高キャッシュをリセットして style.load 後に再構築する
   files.forEach(f => { delete f._takeoffElevMSL; delete f._refRelAlt; });
   const altScale = getSettings().altScale;
   maplibreMap.setStyle(getMapLibreStyle(layerKey, altScale));
@@ -2059,11 +2148,12 @@ document.querySelectorAll('.map-tab').forEach(tab => {
 function applySettings() {
   saveSettings();
   if (allPts.length) { render3D(false); update2D(); updateLegend(); }
-  if (allPts.length && maplibreMap && mlRenderHandler) {
+  if (allPts.length && maplibreMap && maplibreMap.getLayer && maplibreMap.getLayer('ml-flight-3d')) {
     const altScale = getSettings().altScale;
     try { maplibreMap.setTerrain({ source: 'terrain-dem', exaggeration: altScale }); } catch(e) {}
-    updateTerrainPanel(altScale);   // パネル即更新
-    maplibreMap.triggerRepaint();   // drawMLFlightSimple を再実行
+    mlFlightLayer.refresh();         // WebGL buffer を新しい altScale で再構築
+    updateTerrainPanel(altScale);
+    maplibreMap.triggerRepaint();
   } else if (allPts.length && currentView === 'terrain') {
     updateTerrain3D();
   }
@@ -2101,9 +2191,16 @@ document.getElementById('btn-clear-all').onclick = () => {
   allFiles = []; files = []; allPts = [];
   mapTexture = null; mapTextureBounds = null;
   locNameCache = {};
-  // MapLibre オーバーレイをリセット
-  stopMLRendering();
+  // MapLibre レイヤーをリセット
   mlEpoch++;
+  if (maplibreMap) {
+    ['ml-marker-main','ml-marker-halo','ml-shadow-line','ml-flight-3d'].forEach(id => {
+      try { if (maplibreMap.getLayer(id)) maplibreMap.removeLayer(id); } catch(e) {}
+    });
+    ['ml-markers','ml-shadow'].forEach(id => {
+      try { if (maplibreMap.getSource(id)) maplibreMap.removeSource(id); } catch(e) {}
+    });
+  }
   document.getElementById('terrain-elev-detail').innerHTML =
     '<span style="color:var(--text2)">SRTファイルを読み込んでください</span>';
   renderFileList();

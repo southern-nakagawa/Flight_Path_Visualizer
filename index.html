@@ -133,13 +133,13 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
 
 /* 地形3Dビュー */
 #view-terrain { position: absolute; inset: 0; display: none; }
-#maplibre-map { width: 100%; height: 100%; }
+#maplibre-map { width: 100%; height: 100%; position: relative; }
 #terrain-info-panel {
-  position: absolute; bottom: 12px; left: 12px; z-index: 100;
+  position: absolute; bottom: 12px; right: 10px; left: auto; z-index: 100;
   background: rgba(0,0,0,0.68); border: 1px solid rgba(100,160,255,0.2);
   border-radius: 6px; padding: 8px 12px; font-size: 11px;
   color: rgba(255,255,255,0.75); backdrop-filter: blur(4px);
-  max-width: 340px; line-height: 1.8; pointer-events: none;
+  max-width: 320px; line-height: 1.8; pointer-events: none;
 }
 #terrain-info-panel .tip-title { font-family:'Rajdhani',sans-serif; font-size:13px; font-weight:600; color:var(--accent2); margin-bottom:4px; }
 .maplibregl-ctrl-attrib { font-size:9px !important; }
@@ -1521,11 +1521,15 @@ let leafletLayerObj = null;
 let leafletPolylines = [];
 let leafletMarkers = [];
 
-// ===== 地形3D (MapLibre GL JS) =====
+// ===== 地形3D (MapLibre GL JS + 公式 raw WebGL カスタムレイヤー) =====
+//  vertex shader  : gl_Position = u_matrix * vec4(a_pos, 1.0)
+//  a_pos          : Mercator座標 (x, y, z=altitude_in_mercator_units)
+//  u_matrix       : MapLibre が render(gl, matrix) で渡す MVP 行列
+//  これは MapLibre 自身の fill-extrusion レイヤーと同じ方式。
+//  CPU 側で行列計算を一切行わないため形式・精度問題が起こらない。
 let maplibreMap = null;
-let mlStyleLoaded = false;
-let mlFlightSourceAdded = false;
-let takeoffElevCache = {};  // "lat,lon" → 標高(m MSL)
+let mlDragState = { active: false, button: -1, x: 0, y: 0 };
+let mlEpoch     = 0;
 
 function initLeaflet() {
   if (leafletMap) return;
@@ -1552,9 +1556,8 @@ function switchTileLayer(key) {
  * ベースタイル: 現在選択中のレイヤー
  * 地形DEM: Amazon Terrain Tiles (Terrarium形式・無料・APIキー不要)
  */
-function getMapLibreStyle(layerKey) {
+function getMapLibreStyle(layerKey, exaggeration = 1.0) {
   const baseInfo = TILE_LAYERS[layerKey];
-  // OSMは {s} サブドメインを a/b/c に展開
   const tiles = layerKey === 'osm'
     ? ['a','b','c'].map(s => baseInfo.url.replace('{s}', s))
     : [baseInfo.url];
@@ -1571,7 +1574,6 @@ function getMapLibreStyle(layerKey) {
       },
       'terrain-dem': {
         type: 'raster-dem',
-        // Amazon S3 公開 Terrain Tiles (Terrarium形式) — APIキー不要
         tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
         tileSize: 256,
         encoding: 'terrarium',
@@ -1585,14 +1587,12 @@ function getMapLibreStyle(layerKey) {
       source: 'base-raster',
       minzoom: 0, maxzoom: 22
     }],
-    terrain: { source: 'terrain-dem', exaggeration: 1.2 },
+    terrain: { source: 'terrain-dem', exaggeration },
     sky: {
       'sky-color': '#0a0a1a',
       'sky-horizon-blend': 0.4,
       'horizon-color': '#1a2235',
-      'horizon-fog-blend': 0.3,
-      'fog-color': '#0b0f1a',
-      'fog-ground-blend': 0.9
+      'horizon-fog-blend': 0.3
     }
   };
 }
@@ -1614,37 +1614,391 @@ async function queryTerrainElevPoint(lon, lat, maxWait = 4000) {
     await new Promise(res => setTimeout(res, step));
     waited += step;
   }
-  return 0; // タイムアウト → 0m でフォールバック
+  return 0;
 }
 
+// ================================================================
+//  MapLibre カスタム Three.js レイヤー
+//  line レイヤーは terrain にドレープされ高度が無視されるため、
+//  3D ビューと同一の手法（Three.js BufferGeometry）で描画する。
+//
+//  座標変換: lat/lon/altMSL → MercatorCoordinate (x, y, z)
+//  高度:     (baseElev + rel_alt) × altScale   ※地形誇張率に揃える
+// ================================================================
+
 /**
- * MapLibre マップを初期化（遅延初期化: 最初に地形3Dビューを開いた時のみ）
+ * Three.js シーンにフライトパスジオメトリを構築
+ * altScale: 3D ビューと同じ altScale スライダー値
  */
+// ================================================================
+//  MapLibre 地形3D ── Canvas 2D オーバーレイ方式
+//
+//  Three.js カスタムレイヤーの depth buffer 問題を根本解決するため、
+//  MapLibre の MVP 行列で 3D 点をスクリーン投影し、
+//  2D Canvas に直接描画する方式に切り替え。
+//
+//  Mercator Z (高度) の視覚サイズ:
+//    50m @ lat35 ≈ 8.9e-6 Mercator単位 → ズーム14では約38px相当
+//    MVP行列が正しく投影すれば高度差は可視。
+// ================================================================
+
+/**
+ * 3D点 (lon, lat, altMSL) をスクリーン座標に投影
+ * matrix: MapLibre が render() に渡す MVP 行列配列 (column-major, 16要素)
+ */
+
+// ----------------------------------------------------------------
+//  飛行経路 3D ライン用 WebGL カスタムレイヤー（公式パターン）
+// ----------------------------------------------------------------
+const mlFlightLayer = {
+  id: 'ml-flight-3d',
+  type: 'custom',
+  renderingMode: '3d',
+
+  _map: null, _gl: null,
+  _linePrg: null, _pointPrg: null,
+  _lineLoc: null, _pointLoc: null,
+  _buffers: [],   // [{posBuf, colorBuf, count}]
+
+  onAdd(map, gl) {
+    this._map = map;
+    this._gl  = gl;
+
+    // ── 線用シェーダ（頂点色対応） ──
+    const vsLine = `
+      attribute vec3 a_pos;
+      attribute vec3 a_color;
+      uniform mat4 u_matrix;
+      varying vec3 v_color;
+      void main() {
+        v_color = a_color;
+        gl_Position = u_matrix * vec4(a_pos, 1.0);
+      }`;
+    const fsLine = `
+      precision mediump float;
+      varying vec3 v_color;
+      void main() { gl_FragColor = vec4(v_color, 1.0); }`;
+
+    // ── 点用シェーダ（円形・サイズ可変・頂点色対応） ──
+    const vsPoint = `
+      attribute vec3 a_pos;
+      attribute vec3 a_color;
+      uniform mat4 u_matrix;
+      uniform float u_size;
+      varying vec3 v_color;
+      void main() {
+        v_color = a_color;
+        gl_Position = u_matrix * vec4(a_pos, 1.0);
+        gl_PointSize = u_size;
+      }`;
+    const fsPoint = `
+      precision mediump float;
+      varying vec3 v_color;
+      void main() {
+        vec2 c = gl_PointCoord - vec2(0.5);
+        float d = length(c);
+        if (d > 0.5) discard;
+        float a = smoothstep(0.5, 0.42, d);
+        gl_FragColor = vec4(v_color, a);
+      }`;
+
+    const compile = (vsSrc, fsSrc) => {
+      const vs = gl.createShader(gl.VERTEX_SHADER);
+      gl.shaderSource(vs, vsSrc); gl.compileShader(vs);
+      const fs = gl.createShader(gl.FRAGMENT_SHADER);
+      gl.shaderSource(fs, fsSrc); gl.compileShader(fs);
+      const prg = gl.createProgram();
+      gl.attachShader(prg, vs); gl.attachShader(prg, fs);
+      gl.linkProgram(prg);
+      return prg;
+    };
+
+    this._linePrg  = compile(vsLine,  fsLine);
+    this._pointPrg = compile(vsPoint, fsPoint);
+
+    this._lineLoc = {
+      aPos:    gl.getAttribLocation(this._linePrg, 'a_pos'),
+      aColor:  gl.getAttribLocation(this._linePrg, 'a_color'),
+      uMatrix: gl.getUniformLocation(this._linePrg, 'u_matrix')
+    };
+    this._pointLoc = {
+      aPos:    gl.getAttribLocation(this._pointPrg, 'a_pos'),
+      aColor:  gl.getAttribLocation(this._pointPrg, 'a_color'),
+      uMatrix: gl.getUniformLocation(this._pointPrg, 'u_matrix'),
+      uSize:   gl.getUniformLocation(this._pointPrg, 'u_size')
+    };
+
+    this._buildBuffers();
+  },
+
+  onRemove() {
+    this._destroyBuffers();
+    if (this._gl) {
+      if (this._linePrg)  this._gl.deleteProgram(this._linePrg);
+      if (this._pointPrg) this._gl.deleteProgram(this._pointPrg);
+    }
+    this._linePrg = null; this._pointPrg = null; this._gl = null; this._map = null;
+  },
+
+  render(gl, matrix) {
+    if (!this._buffers.length) return;
+
+    const s = getSettings();
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    try { gl.lineWidth(2.0); } catch(e) {}
+
+    // ── ライン描画 (LINE_STRIP) ──
+    gl.useProgram(this._linePrg);
+    gl.uniformMatrix4fv(this._lineLoc.uMatrix, false, matrix);
+    this._buffers.forEach(b => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.posBuf);
+      gl.enableVertexAttribArray(this._lineLoc.aPos);
+      gl.vertexAttribPointer(this._lineLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.colorBuf);
+      gl.enableVertexAttribArray(this._lineLoc.aColor);
+      gl.vertexAttribPointer(this._lineLoc.aColor, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.LINE_STRIP, 0, b.count);
+    });
+
+    // ── ポイント描画 (POINTS、円形、pointScale 連動) ──
+    const dpr = window.devicePixelRatio || 1;
+    const pointSize = Math.max(2, 4.5 * s.pointScale) * dpr;
+    gl.useProgram(this._pointPrg);
+    gl.uniformMatrix4fv(this._pointLoc.uMatrix, false, matrix);
+    gl.uniform1f(this._pointLoc.uSize, pointSize);
+    this._buffers.forEach(b => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.posBuf);
+      gl.enableVertexAttribArray(this._pointLoc.aPos);
+      gl.vertexAttribPointer(this._pointLoc.aPos, 3, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, b.colorBuf);
+      gl.enableVertexAttribArray(this._pointLoc.aColor);
+      gl.vertexAttribPointer(this._pointLoc.aColor, 3, gl.FLOAT, false, 0, 0);
+      gl.drawArrays(gl.POINTS, 0, b.count);
+    });
+  },
+
+  _destroyBuffers() {
+    if (this._gl) {
+      this._buffers.forEach(b => {
+        this._gl.deleteBuffer(b.posBuf);
+        this._gl.deleteBuffer(b.colorBuf);
+      });
+    }
+    this._buffers = [];
+  },
+
+  _buildBuffers() {
+    this._destroyBuffers();
+    if (!this._gl || !allPts.length || !files.length) return;
+    const gl = this._gl;
+    const s = getSettings();
+    const useAltColor = s.colorMode === 'altitude';
+    const maxAlt = Math.max(0.0001, Math.max(...allPts.map(p => p.alt)) * s.altScale);
+
+    files.forEach(f => {
+      const pts = allPts.filter(p => p.fileId === f.id);
+      if (pts.length < 2) return;
+      const baseElev = f._takeoffElevMSL || 0;
+
+      const pos = new Float32Array(pts.length * 3);
+      const col = new Float32Array(pts.length * 3);
+
+      // ファイル色（fallback）
+      const hex = (f.color || '#22d3ee').replace('#', '');
+      const fr = parseInt(hex.substr(0,2), 16) / 255;
+      const fg = parseInt(hex.substr(2,2), 16) / 255;
+      const fb = parseInt(hex.substr(4,2), 16) / 255;
+
+      pts.forEach((p, i) => {
+        const altMSL = (baseElev + p.alt) * s.altScale;
+        const mc = maplibregl.MercatorCoordinate.fromLngLat(
+          { lng: p.lon, lat: p.lat }, altMSL
+        );
+        pos[i*3]   = mc.x;
+        pos[i*3+1] = mc.y;
+        pos[i*3+2] = mc.z;
+
+        if (useAltColor && s.colorLow && s.colorHigh) {
+          const t = Math.max(0, Math.min(1, (p.alt * s.altScale) / maxAlt));
+          col[i*3]   = s.colorLow.r + (s.colorHigh.r - s.colorLow.r) * t;
+          col[i*3+1] = s.colorLow.g + (s.colorHigh.g - s.colorLow.g) * t;
+          col[i*3+2] = s.colorLow.b + (s.colorHigh.b - s.colorLow.b) * t;
+        } else {
+          col[i*3] = fr; col[i*3+1] = fg; col[i*3+2] = fb;
+        }
+      });
+
+      const posBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+
+      const colorBuf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, col, gl.STATIC_DRAW);
+
+      this._buffers.push({ posBuf, colorBuf, count: pts.length });
+    });
+  },
+
+  /** altScale / colorMode / colorLow/High 変更時に再構築 */
+  refresh() {
+    if (!this._gl) return;
+    this._buildBuffers();
+    if (this._map) this._map.triggerRepaint();
+  }
+};
+
+// ----------------------------------------------------------------
+//  shadow (地表トレース) と markers (開始終了) は MapLibre ネイティブ
+// ----------------------------------------------------------------
+function ensureFlightLayer() {
+  if (!maplibreMap || !maplibreMap.isStyleLoaded()) return;
+  if (!maplibreMap.getLayer('ml-flight-3d')) {
+    maplibreMap.addLayer(mlFlightLayer);
+  } else {
+    mlFlightLayer.refresh();
+  }
+}
+
+function ensureShadowAndMarkers() {
+  if (!maplibreMap || !maplibreMap.isStyleLoaded()) return;
+
+  const s = getSettings();
+  const markerR = Math.max(3, 12 * s.markerScale);   // markerScale 反映 (px)
+  const haloR   = markerR * 1.7;
+
+  // GeoJSON 構築
+  const shadowFeatures = [], markerFeatures = [];
+  files.forEach(f => {
+    const pts = allPts.filter(p => p.fileId === f.id);
+    if (pts.length < 2) return;
+    shadowFeatures.push({
+      type: 'Feature',
+      properties: { color: f.color },
+      geometry: { type: 'LineString', coordinates: pts.map(p => [p.lon, p.lat]) }
+    });
+    [
+      { pt: pts[0],              color: '#22c55e', label: '開始' },
+      { pt: pts[pts.length - 1], color: '#ef4444', label: '終了' }
+    ].forEach(({ pt, color, label }) => {
+      markerFeatures.push({
+        type: 'Feature',
+        properties: { color, label, alt: pt.alt.toFixed(1) },
+        geometry: { type: 'Point', coordinates: [pt.lon, pt.lat] }
+      });
+    });
+  });
+
+  const shadowGJ = { type: 'FeatureCollection', features: shadowFeatures };
+  const markerGJ = { type: 'FeatureCollection', features: markerFeatures };
+
+  // Shadow line（showShadow チェック対応）
+  if (maplibreMap.getSource('ml-shadow')) {
+    maplibreMap.getSource('ml-shadow').setData(shadowGJ);
+  } else {
+    maplibreMap.addSource('ml-shadow', { type: 'geojson', data: shadowGJ });
+    maplibreMap.addLayer({
+      id: 'ml-shadow-line', type: 'line', source: 'ml-shadow',
+      layout: { 'line-cap': 'round', 'line-join': 'round',
+                'visibility': s.showShadow ? 'visible' : 'none' },
+      paint: { 'line-color': ['get', 'color'], 'line-width': 1.5,
+               'line-opacity': 0.5, 'line-dasharray': [3, 3] }
+    });
+  }
+  if (maplibreMap.getLayer('ml-shadow-line')) {
+    maplibreMap.setLayoutProperty('ml-shadow-line', 'visibility',
+      s.showShadow ? 'visible' : 'none');
+  }
+
+  // Markers (markerScale 反映)
+  if (maplibreMap.getSource('ml-markers')) {
+    maplibreMap.getSource('ml-markers').setData(markerGJ);
+  } else {
+    maplibreMap.addSource('ml-markers', { type: 'geojson', data: markerGJ });
+    maplibreMap.addLayer({
+      id: 'ml-marker-halo', type: 'circle', source: 'ml-markers',
+      paint: { 'circle-radius': haloR, 'circle-color': ['get', 'color'], 'circle-opacity': 0.2 }
+    });
+    maplibreMap.addLayer({
+      id: 'ml-marker-main', type: 'circle', source: 'ml-markers',
+      paint: { 'circle-radius': markerR, 'circle-color': ['get', 'color'],
+               'circle-stroke-color': '#fff', 'circle-stroke-width': 2 }
+    });
+  }
+  // 半径を最新の markerScale に同期
+  if (maplibreMap.getLayer('ml-marker-halo')) {
+    maplibreMap.setPaintProperty('ml-marker-halo', 'circle-radius', haloR);
+  }
+  if (maplibreMap.getLayer('ml-marker-main')) {
+    maplibreMap.setPaintProperty('ml-marker-main', 'circle-radius', markerR);
+  }
+}
+
 function initMapLibre() {
   return new Promise(resolve => {
     if (maplibreMap) { resolve(); return; }
 
+    const altScale = getSettings().altScale;
     const center = allPts.length
       ? [allPts[0].lon, allPts[0].lat]
-      : [139.692, 35.689]; // デフォルト: 東京
+      : [139.692, 35.689];
 
     maplibreMap = new maplibregl.Map({
       container: 'maplibre-map',
-      style: getMapLibreStyle(currentLayer),
+      style: getMapLibreStyle(currentLayer, altScale),
       center,
       zoom: 13,
-      pitch: 40,       // 俯瞰角を浅めに（急角度だと3D線が壁状に見えるため）
+      pitch: 40,
       bearing: 0,
       maxPitch: 75,
       attributionControl: true
     });
 
-    // ナビゲーションコントロール（回転・ピッチ）
     maplibreMap.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
 
-    maplibreMap.on('style.load', () => {
-      mlStyleLoaded = true;
-      mlFlightSourceAdded = false;
+    // ======================================================
+    // マウス操作を Three.js 3D ビューと同じに入れ替え
+    //   左ドラッグ  = 回転・傾き変更  (Three.js: orbit)
+    //   右ドラッグ  = 平行移動        (Three.js: pan)
+    // ======================================================
+    maplibreMap.dragPan.disable();
+    maplibreMap.dragRotate.disable();
+
+    const canvas = maplibreMap.getCanvas();
+    canvas.addEventListener('contextmenu', e => e.preventDefault());
+    canvas.style.cursor = 'grab';
+
+    canvas.addEventListener('mousedown', e => {
+      if (currentView !== 'terrain') return;
+      mlDragState = { active: true, button: e.button, x: e.clientX, y: e.clientY };
+      canvas.style.cursor = 'grabbing';
+      e.preventDefault();
+    });
+    document.addEventListener('mousemove', e => {
+      if (currentView !== 'terrain' || !mlDragState.active) return;
+      const dx = e.clientX - mlDragState.x;
+      const dy = e.clientY - mlDragState.y;
+      mlDragState.x = e.clientX;
+      mlDragState.y = e.clientY;
+
+      if (mlDragState.button === 0) {
+        // 左ボタン = 回転 + 傾き (Three.js 3D と同じ方向)
+        maplibreMap.setBearing(maplibreMap.getBearing() + dx * 0.5);   // dx符号修正
+        maplibreMap.setPitch(Math.max(0, Math.min(75, maplibreMap.getPitch() - dy * 0.3)));  // dy符号修正
+      } else if (mlDragState.button === 2) {
+        // 右ボタン = 平行移動 (Three.js 3D と同じ)
+        maplibreMap.panBy([-dx, -dy], { animate: false });
+      }
+    });
+    document.addEventListener('mouseup', () => {
+      if (mlDragState.active) {
+        mlDragState.active = false;
+        canvas.style.cursor = 'grab';
+      }
+    });
+
+    maplibreMap.once('style.load', () => {
       resolve();
     });
   });
@@ -1663,13 +2017,30 @@ function initMapLibre() {
  *
  *   SRTが空中から始まる場合: 最小高度フレームの地点で標高を取得し近似値として使用。
  */
+/**
+ * 地形パネルのテキストを更新（altScale スライダー連動含む）
+ */
+function updateTerrainPanel(altScale) {
+  const lines = files.map(f => {
+    const elev = f._takeoffElevMSL || 0;
+    const refStr = (f._refRelAlt || 0) > 5
+      ? `<span style="color:var(--amber)">≈${elev.toFixed(0)}m MSL (推定)</span>`
+      : `<span style="color:var(--accent2)">${elev.toFixed(0)}m MSL</span>`;
+    const name = f.name.length > 22 ? f.name.substring(0,20)+'…' : f.name;
+    return `${name}: 離陸地 ${refStr}`;
+  });
+  document.getElementById('terrain-elev-detail').innerHTML =
+    (lines.length ? lines.join('<br>') : '') +
+    `<br><span style="opacity:0.6;font-size:10px;">高度倍率 <b style="color:var(--accent2)">${altScale}x</b>` +
+    ` ｜ 地形誇張率 ${altScale}x</span>` +
+    '<br><span style="opacity:0.4;font-size:10px;">左ドラッグ=回転/傾き &nbsp; 右ドラッグ=移動</span>';
+}
+
 async function updateTerrain3D() {
   if (currentView !== 'terrain') return;
-
   if (!maplibreMap) await initMapLibre();
-  if (!mlStyleLoaded) {
-    await new Promise(res => maplibreMap.once('style.load', res));
-  }
+
+  const myEpoch = ++mlEpoch;
 
   if (!allPts.length) {
     document.getElementById('terrain-elev-detail').innerHTML =
@@ -1680,175 +2051,90 @@ async function updateTerrain3D() {
   document.getElementById('terrain-elev-detail').innerHTML =
     '<span style="color:var(--amber)">⏳ 地形タイル読み込み中...</span>';
 
-  // --- 1. カメラを先にフィットさせてタイルをロードさせる ---
-  const lons = allPts.map(p => p.lon);
-  const lats = allPts.map(p => p.lat);
-  maplibreMap.fitBounds(
-    [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]],
-    { padding: 80, pitch: 40, bearing: 0, duration: 800, maxZoom: 15 }
-  );
+  const altScale = getSettings().altScale;
 
-  // タイルのレンダリング完了を少し待つ
-  await new Promise(res => setTimeout(res, 1200));
+  if (!maplibreMap.isStyleLoaded()) {
+    await new Promise(res => maplibreMap.once('style.load', res));
+    if (myEpoch !== mlEpoch) return;
+  }
 
-  // --- 2. 各ファイルの参照地点標高をqueryTerrainElevationで取得 ---
-  // SRTが空中スタートの場合もあるため、最小高度フレームの座標を参照地点とする
+  try { maplibreMap.setTerrain({ source: 'terrain-dem', exaggeration: altScale }); } catch(e) {}
+
+  // フライトエリアにフィット（moveend が発火しないケースに備えてタイムアウト併用）
+  const lons = allPts.map(p => p.lon), lats = allPts.map(p => p.lat);
+  let moveResolved = false;
+  await Promise.race([
+    new Promise(res => {
+      maplibreMap.once('moveend', () => { moveResolved = true; res(); });
+      maplibreMap.fitBounds(
+        [[Math.min(...lons), Math.min(...lats)], [Math.max(...lons), Math.max(...lats)]],
+        { padding: 80, pitch: 40, bearing: 0, duration: 800, maxZoom: 15 }
+      );
+    }),
+    new Promise(res => setTimeout(res, 1500))   // 1.5s タイムアウト（ハング防止）
+  ]);
+  if (myEpoch !== mlEpoch) return;
+
+  // 地形タイル読み込みを待つ
+  await new Promise(res => setTimeout(res, 600));
+  if (myEpoch !== mlEpoch) return;
+
+  // 離陸地標高を queryTerrainElevation で取得
   for (const f of files) {
-    if (f._takeoffElevMSL !== undefined) continue; // キャッシュ済み
-    // 最小rel_altのフレーム = 地面に最も近い地点
-    const minAltFrame = f.frames.reduce((min, p) => p.alt < min.alt ? p : min, f.frames[0]);
-    const queryLon = minAltFrame.lon;
-    const queryLat = minAltFrame.lat;
-    const terrainElev = await queryTerrainElevPoint(queryLon, queryLat);
-    // 参照地点の標高 - そのフレームの相対高度 = 離陸地推定標高
-    // ※完全な精度は保証できないが外部APIなしで最善近似
-    f._takeoffElevMSL = Math.max(0, terrainElev - minAltFrame.alt);
-    f._refTerrainElev = terrainElev;
-    f._refRelAlt = minAltFrame.alt;
+    if (f._takeoffElevMSL !== undefined) continue;
+    const fpts = allPts.filter(p => p.fileId === f.id);
+    if (!fpts.length) { f._takeoffElevMSL = 0; f._refRelAlt = 0; continue; }
+    const minPt = fpts.reduce((a, b) => a.alt < b.alt ? a : b);
+    const terrainElev = await queryTerrainElevPoint(minPt.lon, minPt.lat);
+    if (myEpoch !== mlEpoch) return;
+    f._takeoffElevMSL = Math.max(0, terrainElev - minPt.alt);
+    f._refRelAlt = minPt.alt;
   }
 
-  // --- 3. GeoJSON 生成 ---
-  const lineFeatures = [];
-  const pointFeatures = [];
+  // ★★★ 地図が idle 状態（タイル読み込み・レンダ完了）になるまで待機 ★★★
+  // これがないと addLayer 直後の render() がスキップされ、
+  // スライダー操作（idle 状態で発生）で初めて表示される現象が起きる
+  await Promise.race([
+    new Promise(res => {
+      if (maplibreMap.loaded() && !maplibreMap.isMoving()) res();
+      else maplibreMap.once('idle', res);
+    }),
+    new Promise(res => setTimeout(res, 2000))   // ハング防止
+  ]);
+  if (myEpoch !== mlEpoch) return;
 
-  files.forEach(f => {
-    const pts = allPts.filter(p => p.fileId === f.id);
-    if (pts.length < 2) return;
-    const baseElev = f._takeoffElevMSL || 0;
+  // 3D ライン (WebGL カスタムレイヤー) + 地表トレース + マーカー
+  ensureFlightLayer();
+  ensureShadowAndMarkers();
+  mlFlightLayer.refresh();
+  maplibreMap.triggerRepaint();
 
-    // 経路ライン (3D座標: [経度, 緯度, 海抜高度m])
-    lineFeatures.push({
-      type: 'Feature',
-      properties: { fileId: String(f.id), color: f.color, name: f.name },
-      geometry: {
-        type: 'LineString',
-        coordinates: pts.map(p => [p.lon, p.lat, baseElev + p.alt])
-      }
-    });
+  updateTerrainPanel(altScale);
 
-    // 離着陸ポイント
-    const events = f.events && f.events.length
-      ? f.events
-      : [{ type: 'takeoff', frame: pts[0] }, { type: 'landing', frame: pts[pts.length - 1] }];
-
-    events.forEach(ev => {
-      pointFeatures.push({
-        type: 'Feature',
-        properties: {
-          color: ev.type === 'takeoff' ? '#22c55e' : '#ef4444',
-          label: ev.type === 'takeoff' ? '離陸' : '着陸',
-          alt: ev.frame.alt.toFixed(1),
-          msl: (baseElev + ev.frame.alt).toFixed(0)
-        },
-        geometry: {
-          type: 'Point',
-          // ポイントは terrain surface にドレープ（圏内のaltidudeは無視される）
-          coordinates: [ev.frame.lon, ev.frame.lat]
-        }
-      });
-    });
+  // セーフティネット: 次の idle で再度 refresh（addLayer が引き起こす busy 状態対策）
+  maplibreMap.once('idle', () => {
+    if (currentView !== 'terrain' || myEpoch !== mlEpoch) return;
+    if (!maplibreMap.getLayer || !maplibreMap.getLayer('ml-flight-3d')) return;
+    mlFlightLayer.refresh();
+    ensureShadowAndMarkers();
+    maplibreMap.triggerRepaint();
   });
-
-  const lineGeoJSON = { type: 'FeatureCollection', features: lineFeatures };
-  const pointGeoJSON = { type: 'FeatureCollection', features: pointFeatures };
-
-  // --- 4. MapLibre ソース/レイヤー 更新 or 追加 ---
-  if (mlFlightSourceAdded && maplibreMap.getSource('ml-flight-lines')) {
-    maplibreMap.getSource('ml-flight-lines').setData(lineGeoJSON);
-    maplibreMap.getSource('ml-flight-points').setData(pointGeoJSON);
-  } else {
-    maplibreMap.addSource('ml-flight-lines', { type: 'geojson', data: lineGeoJSON });
-    maplibreMap.addSource('ml-flight-points', { type: 'geojson', data: pointGeoJSON });
-
-    // 経路ライン — グロー効果(太め半透明) + メインライン
-    maplibreMap.addLayer({
-      id: 'ml-line-glow',
-      type: 'line',
-      source: 'ml-flight-lines',
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': ['get', 'color'], 'line-width': 9, 'line-opacity': 0.18 }
-    });
-    maplibreMap.addLayer({
-      id: 'ml-line',
-      type: 'line',
-      source: 'ml-flight-lines',
-      layout: { 'line-cap': 'round', 'line-join': 'round' },
-      paint: { 'line-color': ['get', 'color'], 'line-width': 3, 'line-opacity': 0.95 }
-    });
-
-    // 離着陸マーカー（terrain surface上に描画）
-    maplibreMap.addLayer({
-      id: 'ml-point-halo',
-      type: 'circle',
-      source: 'ml-flight-points',
-      paint: {
-        'circle-radius': 14,
-        'circle-color': ['get', 'color'],
-        'circle-opacity': 0.2,
-        'circle-stroke-width': 0
-      }
-    });
-    maplibreMap.addLayer({
-      id: 'ml-point-inner',
-      type: 'circle',
-      source: 'ml-flight-points',
-      paint: {
-        'circle-radius': 7,
-        'circle-color': ['get', 'color'],
-        'circle-stroke-color': '#ffffff',
-        'circle-stroke-width': 2,
-        'circle-opacity': 1
-      }
-    });
-
-    // ポップアップ
-    maplibreMap.on('click', 'ml-point-inner', e => {
-      const props = e.features[0].properties;
-      new maplibregl.Popup({ closeButton: true, className: 'ml-popup' })
-        .setLngLat(e.lngLat)
-        .setHTML(
-          `<b style="color:${props.color}">${props.label}</b><br>` +
-          `rel_alt: ${props.alt} m<br>推定MSL: ${props.msl} m`
-        )
-        .addTo(maplibreMap);
-    });
-    maplibreMap.on('mouseenter', 'ml-point-inner', () => { maplibreMap.getCanvas().style.cursor = 'pointer'; });
-    maplibreMap.on('mouseleave', 'ml-point-inner', () => { maplibreMap.getCanvas().style.cursor = ''; });
-
-    mlFlightSourceAdded = true;
-  }
-
-  // --- 5. 高度情報パネル更新 ---
-  const elevLines = files.map(f => {
-    const elev = f._takeoffElevMSL;
-    const refStr = f._refRelAlt > 5
-      ? `<span style="color:var(--amber)" title="SRT開始時点がrel_alt ${f._refRelAlt.toFixed(0)}m — 推定値">≈${elev.toFixed(0)}m MSL (推定)</span>`
-      : `<span style="color:var(--accent2)">${elev.toFixed(0)}m MSL</span>`;
-    const name = f.name.length > 22 ? f.name.substring(0,20)+'…' : f.name;
-    return `<span style="color:var(--text)">${name}</span>: 離陸地 ${refStr}`;
-  });
-  document.getElementById('terrain-elev-detail').innerHTML =
-    elevLines.join('<br>') +
-    '<br><span style="opacity:0.6;font-size:10px;">' +
-    '表示高度 = 推定離陸地標高 + rel_alt &nbsp;｜&nbsp; ※地形タイルから近似取得</span>';
 }
 
-/**
- * ベースマップ変更時にMapLibreのスタイルを再適用
- */
+
 function switchMapLibreLayer(layerKey) {
   if (!maplibreMap) return;
-  mlStyleLoaded = false;
-  mlFlightSourceAdded = false;
-  // スタイル変更後は terrain タイルが再ロードされるため標高キャッシュをリセット
-  files.forEach(f => { delete f._takeoffElevMSL; delete f._refTerrainElev; delete f._refRelAlt; });
-  maplibreMap.setStyle(getMapLibreStyle(layerKey));
+  mlEpoch++;
+  // setStyle で全レイヤー（カスタムレイヤー含む）が削除されるため
+  // 標高キャッシュをリセットして style.load 後に再構築する
+  files.forEach(f => { delete f._takeoffElevMSL; delete f._refRelAlt; });
+  const altScale = getSettings().altScale;
+  maplibreMap.setStyle(getMapLibreStyle(layerKey, altScale));
   maplibreMap.once('style.load', () => {
-    mlStyleLoaded = true;
-    mlFlightSourceAdded = false;
     if (allPts.length && currentView === 'terrain') updateTerrain3D();
   });
 }
+
 
 function update2D() {
   if (currentView !== '2d') return;
@@ -1921,6 +2207,9 @@ document.querySelectorAll('.vtab').forEach(tab => {
     document.getElementById('view-terrain').style.display= currentView === 'terrain' ? 'block' : 'none';
     document.getElementById('hint3d').style.display      = currentView === '3d'      ? 'block' : 'none';
     document.getElementById('tooltip3d').style.display   = 'none';
+    // 地形3Dビューでは高度カラーレジェンドを非表示（パネルと重複回避）
+    const legendEl = document.getElementById('legend');
+    if (legendEl) legendEl.style.display = currentView === 'terrain' ? 'none' : '';
 
     if (currentView === '2d') {
       if (!leafletMap) initLeaflet();
@@ -1983,8 +2272,16 @@ document.querySelectorAll('.map-tab').forEach(tab => {
 function applySettings() {
   saveSettings();
   if (allPts.length) { render3D(false); update2D(); updateLegend(); }
-  // 地形3Dは高度スケールを使わないため、経路色モードが変わった時のみ更新
-  if (allPts.length && currentView === 'terrain') updateTerrain3D();
+  if (allPts.length && maplibreMap && maplibreMap.getLayer && maplibreMap.getLayer('ml-flight-3d')) {
+    const altScale = getSettings().altScale;
+    try { maplibreMap.setTerrain({ source: 'terrain-dem', exaggeration: altScale }); } catch(e) {}
+    mlFlightLayer.refresh();          // 高度・色を最新設定で再構築
+    ensureShadowAndMarkers();         // マーカー径・shadow 表示を最新設定で反映
+    updateTerrainPanel(altScale);
+    maplibreMap.triggerRepaint();
+  } else if (allPts.length && currentView === 'terrain') {
+    updateTerrain3D();
+  }
 }
 document.getElementById('altScale').oninput = function() { document.getElementById('altScaleVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('zoomSpeed').oninput = function() { document.getElementById('zoomSpeedVal').textContent = this.value; saveSettings(); };
@@ -2019,16 +2316,15 @@ document.getElementById('btn-clear-all').onclick = () => {
   allFiles = []; files = []; allPts = [];
   mapTexture = null; mapTextureBounds = null;
   locNameCache = {};
-  takeoffElevCache = {};
-  // MapLibre: ソース/レイヤーとキャッシュをリセット
-  if (maplibreMap && mlFlightSourceAdded) {
-    ['ml-line-glow','ml-line','ml-point-halo','ml-point-inner'].forEach(id => {
-      if (maplibreMap.getLayer(id)) maplibreMap.removeLayer(id);
+  // MapLibre レイヤーをリセット
+  mlEpoch++;
+  if (maplibreMap) {
+    ['ml-marker-main','ml-marker-halo','ml-shadow-line','ml-flight-3d'].forEach(id => {
+      try { if (maplibreMap.getLayer(id)) maplibreMap.removeLayer(id); } catch(e) {}
     });
-    ['ml-flight-lines','ml-flight-points'].forEach(id => {
-      if (maplibreMap.getSource(id)) maplibreMap.removeSource(id);
+    ['ml-markers','ml-shadow'].forEach(id => {
+      try { if (maplibreMap.getSource(id)) maplibreMap.removeSource(id); } catch(e) {}
     });
-    mlFlightSourceAdded = false;
   }
   document.getElementById('terrain-elev-detail').innerHTML =
     '<span style="color:var(--text2)">SRTファイルを読み込んでください</span>';

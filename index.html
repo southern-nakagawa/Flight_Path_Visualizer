@@ -352,6 +352,13 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
           <span>地表に影を表示</span>
         </label>
       </div>
+      <!-- 地形3D: 経路を常に手前に表示 (depthTest OFF) -->
+      <div style="margin:10px 0;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;" title="ON: メッシュ補間で隠れた経路も透過して常に表示します（地形3Dビュー時のみ有効）">
+          <input type="checkbox" id="alwaysOnTop">
+          <span>地形3D: 経路を常に手前に表示</span>
+        </label>
+      </div>
       <div class="color-row">
         <label>低高度カラー</label>
         <input type="color" id="colorLow" value="#1e40af">
@@ -367,7 +374,7 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
     </div>
 
     <div class="side-section" id="waypoints-section" style="display:none">
-      <h3>離着陸ポイント</h3>
+      <h3>録画開始 / 終了位置</h3>
       <div id="waypoints-list" style="display:flex;flex-direction:column;gap:6px;"></div>
     </div>
 
@@ -434,7 +441,7 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
     <div id="tooltip3d"><div class="tt-title" id="tt-title"></div><div id="tt-body"></div></div>
 
     <div id="hint3d">左ドラッグ: 回転 &nbsp;右ドラッグ: 移動<br>ホイール: ズーム</div>
-    <div id="map-credit" style="position:absolute;right:12px;bottom:12px;z-index:1000;font-size:10px;color:rgba(255, 255, 255, 0.4);background:rgba(0,0,0,0.4);padding:3px 7px;border-radius:4px;pointer-events:none;"></div>
+    <div id="map-credit" style="position:absolute;right:12px;bottom:12px;z-index:1000;font-size:10px;color:rgba(255,255,255,0.5);background:rgba(0,0,0,0.4);padding:3px 7px;border-radius:4px;pointer-events:none;"></div>
     <div id="legend" style="display:none">
       <span>高度カラー</span>
       <canvas id="legend-canvas" width="100" height="8"></canvas>
@@ -464,30 +471,6 @@ function haversine(a, b) {
 }
 function fmtDist(m) { return m >= 1000 ? (m/1000).toFixed(2)+' km' : Math.round(m)+' m'; }
 
-function detectLandingEvents(frames) {
-  const events = [];
-  if (!frames.length) return events;
-  let tookOff = false;
-  for (let i = 0; i < frames.length; i++) {
-    if (!tookOff && frames[i].alt > 3) {
-      const idx = Math.max(0, i - 1);
-      events.push({ type: 'takeoff', frame: frames[idx] });
-      tookOff = true;
-    }
-    if (tookOff && i > 0 && frames[i].alt < 3 && frames[i-1].alt >= 3) {
-      const next = frames[Math.min(i+5, frames.length-1)];
-      const dist = haversine(frames[i], next);
-      const dt = (new Date(next.ts) - new Date(frames[i].ts)) / 1000 || 1;
-      const speed = dist / dt;
-      if (speed < 3) {
-        events.push({ type: 'landing', frame: frames[i] });
-        tookOff = false;
-      }
-    }
-  }
-  if (tookOff) events.push({ type: 'landing', frame: frames[frames.length-1] });
-  return events;
-}
 function fmtDur(sec) {
   const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
   return h > 0 ? `${h}時間${m}分` : m > 0 ? `${m}分${s}秒` : `${s}秒`;
@@ -599,8 +582,9 @@ function updateWaypoints() {
     const dur = (new Date(f.frames[f.frames.length-1].ts) - new Date(f.frames[0].ts)) / 1000;
     const events = f.events || [];
     let evHtml = events.map(ev => {
-      const icon = ev.type === 'takeoff' ? '🟢' : '🔴';
-      const label = ev.type === 'takeoff' ? '離陸' : '着陸';
+      const isStart = ev.type === 'recstart';
+      const icon = isStart ? '🔴' : '⬛';
+      const label = isStart ? '録画開始' : '録画終了';
       return `<div style="display:flex;align-items:center;gap:4px;margin-top:3px;">
         ${icon} <span style="color:var(--text2)">${label}</span>
         <span style="color:var(--text);font-size:10px;">${ev.frame.lat.toFixed(5)}, ${ev.frame.lon.toFixed(5)} &nbsp; rel:${ev.frame.alt.toFixed(1)}m</span>
@@ -645,11 +629,17 @@ function addFiles(fileList) {
       if (!frames.length) { showError(`${file.name}: GPS座標なし`); pending--; if (!pending) finalizeLoad(); return; }
       const id = Date.now() + Math.random();
       const color = COLORS[allFiles.length % COLORS.length];
-      const events = detectLandingEvents(frames);
+      // 録画開始 / 終了位置を 2 個マーカー化 (離着陸自動認識は廃止)
+      //   理由: 飛行中にユーザが録画 ON/OFF するとファイル分割されるため、
+      //         先頭/末尾フレーム = 離陸/着陸 とは限らない
+      const events = [
+        { type: 'recstart', frame: frames[0] },
+        { type: 'recend',   frame: frames[frames.length-1] }
+      ];
       let dist = 0; for (let i = 1; i < frames.length; i++) dist += haversine(frames[i-1], frames[i]);
       const dur = (new Date(frames[frames.length-1].ts) - new Date(frames[0].ts)) / 1000;
       const maxAlt = Math.max(...frames.map(p => p.alt));
-      allFiles.push({ id, name: file.name, frames, color, events, visible: true,
+      allFiles.push({ id, name: file.name, frames, color, events, visible: true, elevOffset: 0,
         _date: frames[0].ts.substring(0, 10), _dur: dur, _maxAlt: maxAlt, _dist: dist,
         _locKey: frames[0].lat.toFixed(2) + ',' + frames[0].lon.toFixed(2) });
       pending--; if (!pending) finalizeLoad();
@@ -824,8 +814,9 @@ function renderFlightTable(list) {
     div.style.cssText = `display:flex;align-items:flex-start;gap:7px;padding:6px 4px;border-bottom:1px solid var(--border);`;
 
     const evHtml = (f.events || []).map(ev => {
-      const icon  = ev.type === 'takeoff' ? '🟢' : '🔴';
-      const label = ev.type === 'takeoff' ? '離陸' : '着陸';
+      const isStart = ev.type === 'recstart';
+      const icon = isStart ? '🔴' : '⬛';
+      const label = isStart ? '録画開始' : '録画終了';
       return `<span style="display:inline-flex;align-items:center;gap:2px;margin-right:6px;">
         ${icon}<span style="color:var(--text2);">${label}</span>
         <span style="color:var(--text);">${ev.frame.lat.toFixed(5)},${ev.frame.lon.toFixed(5)} ${ev.frame.alt.toFixed(1)}m</span>
@@ -841,14 +832,28 @@ function renderFlightTable(list) {
           📅 ${dateTimeStr} &nbsp;⏱ ${fmtDur(Math.round(f._dur))} &nbsp;↑ ${f._maxAlt.toFixed(0)}m &nbsp;🛤 ${distStr}
         </div>
         <div style="font-size:10px;margin-top:2px;line-height:1.7;">${evHtml}</div>
+        <div class="elev-offset-row" style="display:flex;align-items:center;gap:5px;font-size:10px;margin-top:3px;color:var(--text2);" title="地形3Dビュー時、ファイル先頭フレーム (録画開始点) の標高を ±m で補正します。岩場・橋・屋上など DEM 解像度では表現できない地形や、空中で録画開始した場合に有効。">
+          🗻 標高補正
+          <input type="number" data-offset-id="${f.id}" step="0.5" value="${(f.elevOffset||0).toFixed(1)}"
+            style="width:55px;background:var(--panel);border:1px solid var(--border);border-radius:3px;color:var(--accent2);padding:1px 4px;font-family:Rajdhani,sans-serif;font-size:11px;text-align:right;">
+          <span>m</span>
+        </div>
       </div>`;
-    div.querySelector('input').onchange = e => {
+    div.querySelector('input[type=checkbox]').onchange = e => {
       const target = allFiles.find(a => String(a.id) === e.target.dataset.id);
       if (target) {
         target.visible = e.target.checked;
         files = list.filter(f => f.visible);
         updateCountLabel(list);
         syncDisplay(list);
+      }
+    };
+    div.querySelector('input[data-offset-id]').onchange = e => {
+      const target = allFiles.find(a => String(a.id) === e.target.dataset.offsetId);
+      if (target) {
+        target.elevOffset = parseFloat(e.target.value) || 0;
+        // 地形3D 表示中なら即時再描画 (カメラ保持)
+        if (terrainMode && allPts.length) render3D(false);
       }
     };
     tbody.appendChild(div);
@@ -1088,6 +1093,7 @@ function getSettings() {
     markerScale: parseFloat(document.getElementById('markerSize').value),
     pointScale: parseFloat(document.getElementById('pointSize').value),
     showShadow: document.getElementById('showShadow').checked,
+    alwaysOnTop: document.getElementById('alwaysOnTop').checked,
     colorMode: cm ? cm.value : 'altitude',
     colorLow: hexToRgb(document.getElementById('colorLow').value),
     colorHigh: hexToRgb(document.getElementById('colorHigh').value),
@@ -1102,6 +1108,7 @@ function saveSettings() {
     markerSize: document.getElementById('markerSize').value,
     pointSize: document.getElementById('pointSize').value,
     showShadow: document.getElementById('showShadow').checked,
+    alwaysOnTop: document.getElementById('alwaysOnTop').checked,
     colorMode: document.querySelector('input[name="colorMode"]:checked').value,
     colorLow: document.getElementById('colorLow').value,
     colorHigh: document.getElementById('colorHigh').value,
@@ -1120,6 +1127,7 @@ function loadSettings() {
     if (d.markerSize) { document.getElementById('markerSize').value = d.markerSize; document.getElementById('markerSizeVal').textContent = d.markerSize + 'x'; }
     if (d.pointSize)  { document.getElementById('pointSize').value = d.pointSize; document.getElementById('pointSizeVal').textContent = d.pointSize + 'x'; }
     if (d.showShadow !== undefined) document.getElementById('showShadow').checked = d.showShadow;
+    if (d.alwaysOnTop !== undefined) document.getElementById('alwaysOnTop').checked = d.alwaysOnTop;
     if (d.colorMode) { document.querySelector(`input[name="colorMode"][value="${d.colorMode}"]`).checked = true; }
     if (d.colorLow)  document.getElementById('colorLow').value = d.colorLow;
     if (d.colorHigh) document.getElementById('colorHigh').value = d.colorHigh;
@@ -1183,16 +1191,27 @@ async function render3D(resetView) {
   scene3d.add(dir);
 
   // ===== ファイル毎の離陸地点標高を確定 (DEM プリロード済みなので即時) =====
+  //   モード3 (snap-to-terrain, デフォルト):
+  //     離陸点 (時系列最初の点) を DEM 表面にぴったり貼り付ける
+  //     autoBase = DEM(takeoff_lon, takeoff_lat) - takeoff.rel_alt
+  //   モード1 (manual offset):
+  //     f.elevOffset で ±m 補正 (岩場・橋・屋上など、DEM 解像度 10m格子では
+  //     表現できない離陸面の高さズレを吸収する)
+  //   最終: baseElev = autoBase + offset
   const baseElevByFile = new Map();
   let globalBaseElev = 0;
+  let globalAutoBase = 0;
+  let globalOffset = 0;
   if (terrainMode) {
     files.forEach(f => {
       const fpts = allPts.filter(p => p.fileId === f.id);
       if (!fpts.length) { baseElevByFile.set(f.id, 0); return; }
-      // 最低 rel_alt の地点 ≒ 離陸地点直上 → その地表標高 - 地点rel_alt = 離陸地点標高
-      const minPt = fpts.reduce((a, b) => a.alt < b.alt ? a : b);
-      const elev = sampleElevation(minPt.lon, minPt.lat);
-      baseElevByFile.set(f.id, Math.max(0, elev - minPt.alt));
+      const takeoff = fpts[0];  // 時系列最初の点 = 離陸点
+      const demAtTakeoff = sampleElevation(takeoff.lon, takeoff.lat);
+      const autoBase = demAtTakeoff - takeoff.alt;
+      const offset = f.elevOffset || 0;
+      baseElevByFile.set(f.id, autoBase + offset);
+      if (f === files[0]) { globalAutoBase = autoBase; globalOffset = offset; }
     });
     if (files.length) globalBaseElev = baseElevByFile.get(files[0].id) || 0;
   }
@@ -1268,6 +1287,11 @@ async function render3D(resetView) {
   scene3d.userData.buildingsGroup = buildingsGroup;
 
   // ===== 経路・ポイント描画 =====
+  //   地形3Dモードかつ「経路を常に手前に表示」ON のとき、
+  //   DEM 補間によりメッシュに埋もれた経路が見えるよう depthTest を OFF にする。
+  //   デフォルト OFF (= 通常の遮蔽あり)。「埋もれて見えない」現象は多くの場合
+  //   GPS dropout (lat/lon=0 行のスキップ) が原因で、深度テストは関係しない。
+  const flightDepthTest = !(terrainMode && s.alwaysOnTop);
   const hoverSpheres = [];
   files.forEach(f => {
     const pts = allPts.filter(p => p.fileId === f.id);
@@ -1295,7 +1319,9 @@ async function render3D(resetView) {
     const lineGeo = new THREE.BufferGeometry();
     lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
     lineGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    scene3d.add(new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 1 })));
+    const lineMesh = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ vertexColors: true, linewidth: 1, depthTest: flightDepthTest }));
+    if (terrainMode) lineMesh.renderOrder = 2;
+    scene3d.add(lineMesh);
 
     const dotR = Math.max(0.3, span * 0.004) * s.pointScale;
     const dotGeo = new THREE.SphereGeometry(dotR, 8, 8);
@@ -1311,16 +1337,19 @@ async function render3D(resetView) {
       const sGeo = new THREE.BufferGeometry();
       sGeo.setAttribute('position', new THREE.Float32BufferAttribute(shadowPos, 3));
       sGeo.setAttribute('color', new THREE.Float32BufferAttribute(shadowColors, 3));
-      scene3d.add(new THREE.Line(sGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.1 })));
+      const shLine = new THREE.Line(sGeo, new THREE.LineBasicMaterial({ vertexColors: true, transparent: true, opacity: 0.1, depthTest: flightDepthTest }));
+      if (terrainMode) shLine.renderOrder = 2;
+      scene3d.add(shLine);
 
       const shadowDotGeo = new THREE.SphereGeometry(dotR, 8, 8);
       pts.forEach(p => {
         const sc = colorAt(p);
         const shadowDot = new THREE.Mesh(
           shadowDotGeo,
-          new THREE.MeshBasicMaterial({ color: sc, transparent: true, opacity: 0.2 })
+          new THREE.MeshBasicMaterial({ color: sc, transparent: true, opacity: 0.2, depthTest: flightDepthTest })
         );
         shadowDot.position.set(p.mx, groundY(p.lon, p.lat), p.my);
+        if (terrainMode) shadowDot.renderOrder = 2;
         scene3d.add(shadowDot);
       });
     }
@@ -1330,13 +1359,15 @@ async function render3D(resetView) {
       const vstep = Math.max(1, Math.floor(pts.length / 40));
       for (let i = 0; i < pts.length; i += vstep) {
         const p = pts[i];
-        if (p.alt * s.altScale < 1) continue;
+        if (Math.abs(p.alt) * s.altScale < 1) continue;  // 地表とほぼ同じ高さなら省略 (絶対値で負も対象)
         const vc = colorAt(p);
         const vGeo = new THREE.BufferGeometry().setFromPoints([
           new THREE.Vector3(p.mx, yOfPoint(p, f.id), p.my),
           new THREE.Vector3(p.mx, groundY(p.lon, p.lat), p.my)
         ]);
-        scene3d.add(new THREE.Line(vGeo, new THREE.LineBasicMaterial({ color: vc, transparent: true, opacity: 0.2 })));
+        const vLine = new THREE.Line(vGeo, new THREE.LineBasicMaterial({ color: vc, transparent: true, opacity: 0.2, depthTest: flightDepthTest }));
+        if (terrainMode) vLine.renderOrder = 2;
+        scene3d.add(vLine);
       }
     }
 
@@ -1349,47 +1380,53 @@ async function render3D(resetView) {
         opacity: 0.75,
         emissive: dotColor,
         emissiveIntensity: 0.15,
+        depthTest: flightDepthTest,
       }));
       dot.position.set(p.mx, yOfPoint(p, f.id), p.my);
       dot.userData = { pt: p, fileName: f.name };
+      if (terrainMode) dot.renderOrder = 2;
       scene3d.add(dot);
       hoverSpheres.push(dot);
     });
 
-    // 離着陸マーカー
+    // 録画開始 / 終了マーカー (各ファイル先頭・末尾フレームに 1 個ずつ)
     const baseMarker = span * 0.013 * s.markerScale;
     const events = f.events || [
-      { type: 'takeoff', frame: pts[0] },
-      { type: 'landing', frame: pts[pts.length-1] }
+      { type: 'recstart', frame: pts[0] },
+      { type: 'recend',   frame: pts[pts.length-1] }
     ];
     events.forEach(ev => {
       const p = ev.frame;
       const mp = allPts.find(ap => ap.lat === p.lat && ap.lon === p.lon) || pts[0];
-      const color = ev.type === 'takeoff' ? 0x22c55e : 0xef4444;
+      const color = ev.type === 'recstart' ? 0xef4444 : 0x7f1d1d;  // 開始=明るい赤、終了=暗い赤
       const sGeo = new THREE.SphereGeometry(baseMarker, 16, 16);
-      const sMat = new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: 0.3 });
+      const sMat = new THREE.MeshLambertMaterial({ color, emissive: color, emissiveIntensity: 0.3, depthTest: flightDepthTest });
       const sphere = new THREE.Mesh(sGeo, sMat);
       sphere.position.set(mp.mx, yOfPoint(mp, f.id), mp.my);
+      if (terrainMode) sphere.renderOrder = 2;
       scene3d.add(sphere);
       const rGeo = new THREE.TorusGeometry(baseMarker * 1.8, baseMarker * 0.35, 8, 40);
-      const rMat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.8 });
+      const rMat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.8, depthTest: flightDepthTest });
       const ring = new THREE.Mesh(rGeo, rMat);
       ring.rotation.x = -Math.PI / 2;
       // 地表のすぐ上に配置 (地形モードではその地点の地表標高に追従)
       const ringY = terrainMode ? sampleElevation(mp.lon, mp.lat) * s.altScale + 0.4 : 0.4;
       ring.position.set(mp.mx, ringY, mp.my);
+      if (terrainMode) ring.renderOrder = 2;
       scene3d.add(ring);
       const vGeo2 = new THREE.BufferGeometry().setFromPoints([
         new THREE.Vector3(mp.mx, yOfPoint(mp, f.id), mp.my),
         new THREE.Vector3(mp.mx, ringY, mp.my)
       ]);
-      scene3d.add(new THREE.Line(vGeo2, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 })));
+      const vLine2 = new THREE.Line(vGeo2, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6, depthTest: flightDepthTest }));
+      if (terrainMode) vLine2.renderOrder = 2;
+      scene3d.add(vLine2);
     });
   });
 
   // ===== 地形3D 情報パネル更新 =====
   if (terrainMode) {
-    updateTerrainInfoPanel(s.altScale, globalBaseElev, terrainElevRange.min, terrainElevRange.max);
+    updateTerrainInfoPanel(s.altScale, globalBaseElev, terrainElevRange.min, terrainElevRange.max, globalAutoBase, globalOffset);
   }
 
   if (animId3d) cancelAnimationFrame(animId3d);
@@ -1732,11 +1769,15 @@ async function buildTerrainMesh(bounds, altScale) {
 }
 
 // --- 地形情報パネルの更新 ---
-function updateTerrainInfoPanel(altScale, baseElev, terrainMin, terrainMax) {
+function updateTerrainInfoPanel(altScale, baseElev, terrainMin, terrainMax, autoBase, offset) {
   const maxRel = Math.max(...allPts.map(p => p.alt));
   const droneMSL_max = baseElev + maxRel;
+  // オフセット表示: 補正がかかっているときだけ強調表示
+  const offsetTxt = (offset && Math.abs(offset) > 0.01)
+    ? ` <span style="color:var(--amber)">(自動 ${autoBase.toFixed(1)} ${offset>=0?'+':'−'} ${Math.abs(offset).toFixed(1)})</span>`
+    : '';
   document.getElementById('terrain-elev-detail').innerHTML =
-    `<span style="color:var(--accent2)">離陸地標高 ${baseElev.toFixed(1)} m MSL</span>` +
+    `<span style="color:var(--accent2)">録画開始地点標高 ${baseElev.toFixed(1)} m MSL</span>${offsetTxt}` +
     `<span style="color:var(--text2)"> ｜ 地形誇張率 ${altScale}x</span><br>` +
     `<span style="color:var(--text2)">地形範囲 ${terrainMin.toFixed(0)}〜${terrainMax.toFixed(0)} m MSL</span><br>` +
     `<span style="color:var(--text2)">ドローン最高 ${droneMSL_max.toFixed(1)} m MSL (${maxRel.toFixed(1)} m AGL)</span>`;
@@ -1784,12 +1825,13 @@ function update2D() {
       iconSize: [14, 28], iconAnchor: [7, 7], className: ''
     });
     const events = f.events || [
-      { type: 'takeoff', frame: pts[0] },
-      { type: 'landing', frame: pts[pts.length-1] }
+      { type: 'recstart', frame: pts[0] },
+      { type: 'recend',   frame: pts[pts.length-1] }
     ];
     events.forEach(ev => {
-      const color = ev.type === 'takeoff' ? '#22c55e' : '#ef4444';
-      const label = ev.type === 'takeoff' ? '離陸' : '着陸';
+      const isStart = ev.type === 'recstart';
+      const color = isStart ? '#ef4444' : '#7f1d1d';
+      const label = isStart ? '録画開始' : '録画終了';
       const m = L.marker([ev.frame.lat, ev.frame.lon], { icon: mkIcon(color, label) })
         .bindTooltip(`${label}: ${f.name} (${ev.frame.alt.toFixed(1)}m)`);
       m.addTo(leafletMap);
@@ -1886,6 +1928,7 @@ document.getElementById('zoomSpeed').oninput = function() { document.getElementB
 document.getElementById('markerSize').oninput = function() { document.getElementById('markerSizeVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('pointSize').oninput = function() { document.getElementById('pointSizeVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('showShadow').onchange = applySettings;
+document.getElementById('alwaysOnTop').onchange = applySettings;
 document.getElementById('colorLow').oninput = applySettings;
 document.getElementById('colorHigh').oninput = applySettings;
 document.getElementById('colorGrid').oninput = applySettings;
@@ -2086,7 +2129,7 @@ document.getElementById('btn-export-pdf').onclick = async () => {
         ctx.stroke();
         (f.events||[]).forEach(ev => {
           const px = leafletMap.latLngToContainerPoint([ev.frame.lat, ev.frame.lon]);
-          ctx.globalAlpha = 1; ctx.fillStyle = ev.type==='takeoff'?'#22c55e':'#ef4444';
+          ctx.globalAlpha = 1; ctx.fillStyle = ev.type === 'recstart' ? '#ef4444' : '#7f1d1d';
           ctx.beginPath(); ctx.arc(px.x, px.y, 7, 0, Math.PI*2); ctx.fill();
         });
       });
@@ -2163,14 +2206,15 @@ document.getElementById('btn-export-pdf').onclick = async () => {
     // --- 離着陸ポイント ---
     if(y<PH-mg-28){
       y+=2; pdf.setDrawColor(200,210,225); pdf.setLineWidth(0.2); pdf.line(mg,y,mg+leftW,y); y+=5;
-      pdf.setFont('helvetica','bold'); pdf.setFontSize(8); pdf.setTextColor(30,64,175); pdf.text('WAYPOINTS',mg,y); y+=4;
+      pdf.setFont('helvetica','bold'); pdf.setFontSize(8); pdf.setTextColor(30,64,175); pdf.text('REC START / END',mg,y); y+=4;
       files.forEach(f=>{
         (f.events||[]).forEach(ev=>{
           if(y>PH-mg-6) return;
-          const isTakeoff=ev.type==='takeoff';
+          const isStart = ev.type === 'recstart';
           pdf.setFont('helvetica','normal'); pdf.setFontSize(7);
-          pdf.setTextColor(isTakeoff?22:185, isTakeoff?163:28, isTakeoff?74:28);
-          pdf.text(isTakeoff?'T/O':'LDG', mg, y);
+          if (isStart) pdf.setTextColor(239, 68, 68);   // 明るい赤
+          else         pdf.setTextColor(127, 29, 29);   // 暗い赤
+          pdf.text(isStart ? 'REC ▶' : 'REC ■', mg, y);
           pdf.setTextColor(60,80,110);
           pdf.text(ev.frame.lat.toFixed(5)+', '+ev.frame.lon.toFixed(5)+', '+ev.frame.alt.toFixed(1)+'m ', mg+14, y); y+=4.5;
         });

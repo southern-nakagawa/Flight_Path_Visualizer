@@ -1179,14 +1179,17 @@ async function render3D(resetView) {
 
   scene3d = new THREE.Scene();
   scene3d.background = new THREE.Color(0x0a0a1a);
-  scene3d.fog = new THREE.FogExp2(0x0a0a1a, 0.0005);
+  // フォグ: 地形3Dでは航空写真の色を正確に見せるため無効化 (紺色フォグは遠方を青暗くする)
+  scene3d.fog = terrainMode ? null : new THREE.FogExp2(0x0a0a1a, 0.0005);
 
   if (!camera3d || camera3d.aspect !== W/H) {
     camera3d = new THREE.PerspectiveCamera(50, W/H, 0.1, 50000);
   }
 
-  scene3d.add(new THREE.AmbientLight(0xffffff, 0.7));
-  const dir = new THREE.DirectionalLight(0x88aaff, 0.8);
+  // ライティング: 地形メッシュ (Lambert) はライト色がテクスチャに乗算されるため、
+  // 色被りを避けるには白色光であることが必須 (青系 0x88aaff だと航空写真が青被りする)
+  scene3d.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.5);
   dir.position.set(100, 200, 100);
   scene3d.add(dir);
 

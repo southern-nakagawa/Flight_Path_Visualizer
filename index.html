@@ -39,6 +39,7 @@
 <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600&family=Noto+Sans+JP:wght@300;400;500&display=swap');
 
@@ -227,6 +228,7 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
   </h1>
   <div style="display:flex;gap:8px;">
     <button class="btn btn-ghost btn-sm" id="btn-export-pdf" style="border-color:rgba(34,211,238,0.4);color:var(--accent2);">📄 PDF出力</button>
+    <button class="btn btn-ghost btn-sm" id="btn-export-movie" style="border-color:rgba(168,139,250,0.5);color:#a78bfa;">🎬 動画</button>
     <button class="btn btn-ghost btn-sm" id="btn-about" style="border-color:rgba(100,160,255,0.3);">ℹ️</button>
   </div>
 </div>
@@ -344,6 +346,12 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
         <span class="ctrl-label">ポイント径</span>
         <input type="range" id="pointSize" min="0.5" max="3.0" step="0.1" value="1.0">
         <span class="ctrl-val" id="pointSizeVal">1.0x</span>
+      </div>
+      <!-- 地形3D 明るさ微調整 (自動光量 × この倍率) -->
+      <div class="ctrl-row" title="地形3Dの明るさを微調整します。地図サイズに応じた自動光量にこの倍率を掛けます。ハレーション(白飛び)するときは下げてください。">
+        <span class="ctrl-label">地形明るさ</span>
+        <input type="range" id="lightScale" min="0.3" max="1.5" step="0.05" value="1.0">
+        <span class="ctrl-val" id="lightScaleVal">1.0x</span>
       </div>
       <!-- 影表示 -->
       <div style="margin:10px 0;">
@@ -1092,6 +1100,7 @@ function getSettings() {
     zoomSpeed: zoomRaw / 100,
     markerScale: parseFloat(document.getElementById('markerSize').value),
     pointScale: parseFloat(document.getElementById('pointSize').value),
+    lightScale: parseFloat(document.getElementById('lightScale').value),
     showShadow: document.getElementById('showShadow').checked,
     alwaysOnTop: document.getElementById('alwaysOnTop').checked,
     colorMode: cm ? cm.value : 'altitude',
@@ -1107,6 +1116,7 @@ function saveSettings() {
     zoomSpeed: document.getElementById('zoomSpeed').value,
     markerSize: document.getElementById('markerSize').value,
     pointSize: document.getElementById('pointSize').value,
+    lightScale: document.getElementById('lightScale').value,
     showShadow: document.getElementById('showShadow').checked,
     alwaysOnTop: document.getElementById('alwaysOnTop').checked,
     colorMode: document.querySelector('input[name="colorMode"]:checked').value,
@@ -1126,6 +1136,7 @@ function loadSettings() {
     if (d.zoomSpeed)  { document.getElementById('zoomSpeed').value = d.zoomSpeed; document.getElementById('zoomSpeedVal').textContent = d.zoomSpeed; }
     if (d.markerSize) { document.getElementById('markerSize').value = d.markerSize; document.getElementById('markerSizeVal').textContent = d.markerSize + 'x'; }
     if (d.pointSize)  { document.getElementById('pointSize').value = d.pointSize; document.getElementById('pointSizeVal').textContent = d.pointSize + 'x'; }
+    if (d.lightScale) { document.getElementById('lightScale').value = d.lightScale; document.getElementById('lightScaleVal').textContent = d.lightScale + 'x'; }
     if (d.showShadow !== undefined) document.getElementById('showShadow').checked = d.showShadow;
     if (d.alwaysOnTop !== undefined) document.getElementById('alwaysOnTop').checked = d.alwaysOnTop;
     if (d.colorMode) { document.querySelector(`input[name="colorMode"][value="${d.colorMode}"]`).checked = true; }
@@ -1160,7 +1171,7 @@ async function render3D(resetView) {
   const s = getSettings();
 
   if (!renderer3d) {
-    renderer3d = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+    renderer3d = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false, preserveDrawingBuffer: true });
     renderer3d.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   }
   renderer3d.setSize(W, H);
@@ -1186,12 +1197,7 @@ async function render3D(resetView) {
     camera3d = new THREE.PerspectiveCamera(50, W/H, 0.1, 50000);
   }
 
-  // ライティング: 地形メッシュ (Lambert) はライト色がテクスチャに乗算されるため、
-  // 色被りを避けるには白色光であることが必須 (青系 0x88aaff だと航空写真が青被りする)
-  scene3d.add(new THREE.AmbientLight(0xffffff, 0.85));
-  const dir = new THREE.DirectionalLight(0xffffff, 0.5);
-  dir.position.set(100, 200, 100);
-  scene3d.add(dir);
+  // ライティングは span (地図サイズ) 確定後に設定する → 後述
 
   // ===== ファイル毎の離陸地点標高を確定 (DEM プリロード済みなので即時) =====
   //   モード3 (snap-to-terrain, デフォルト):
@@ -1230,6 +1236,21 @@ async function render3D(resetView) {
   const span = Math.max(Math.max(...xs)-Math.min(...xs), Math.max(...zs)-Math.min(...zs), 200);
   const maxRelAlt = Math.max(...allPts.map(p => p.alt));
   const maxAlt = maxRelAlt * s.altScale;  // 既存コードの色補間用 (rel_alt スケール基準を維持)
+
+  // ===== ライティング (地図サイズ連動 + 手動倍率) =====
+  //   ハレーション(白飛び)対策:
+  //     小さい地図 → 地形メッシュが画面いっぱい & 視点が近い → 光が飽和しやすい
+  //     大きい地図 → 遠方がフォグ/距離で暗くなり立体感が出る
+  //   そこで span が小さいほど環境光を弱める自動調整を入れ、
+  //   さらに s.lightScale (0.3〜1.5) で手動微調整できるようにする。
+  //   白色光必須: Lambert はライト色がテクスチャに乗算されるため (青被り防止)。
+  const sizeNorm = Math.min(1, Math.max(0, (span - 200) / 1800));  // 200m→0, 2000m→1
+  const ambBase = 0.5 + sizeNorm * 0.35;   // 小=0.50 / 大=0.85
+  const dirBase = 0.25 + sizeNorm * 0.25;  // 小=0.25 / 大=0.50
+  scene3d.add(new THREE.AmbientLight(0xffffff, ambBase * s.lightScale));
+  const dir = new THREE.DirectionalLight(0xffffff, dirBase * s.lightScale);
+  dir.position.set(100, 200, 100);
+  scene3d.add(dir);
 
   // カメラターゲット Y は地形モードでは離陸地表分だけ持ち上げる (経路が画面中央に来る)
   const targetY = terrainMode
@@ -1456,6 +1477,140 @@ function updateCamera3D() {
   const disk = document.getElementById('compass-disk');
   if (disk) disk.setAttribute('transform', `rotate(${theta * 180 / Math.PI},18,18)`);
 }
+
+// ============================================================
+//  ノーズインサークル動画書き出し (5秒)
+//   - 手動で選んだ現在の視点を中心に方位を -90°→+90° スイープ (180°円弧)
+//   - ピッチ角 20°→45°→20° (中間で最も俯瞰し立体感を出す)
+//   - 距離 sph.r / 注視点 target3d は現在値を維持
+//
+//   出力方式はブラウザで自動判定:
+//     WebM 対応 (Chrome/Edge) → MediaRecorder で .webm 動画
+//     非対応 (Safari)        → 連番 PNG を ZIP で書き出し (外部で動画化)
+// ============================================================
+let isRecordingMovie = false;
+const MOVIE_DURATION = 5000;   // 5秒
+const MOVIE_FPS = 30;
+const MOVIE_SWEEP = Math.PI / 2;                 // ±90°
+const MOVIE_PITCH_MIN = 20 * Math.PI / 180;
+const MOVIE_PITCH_MAX = 45 * Math.PI / 180;
+
+// 進行度 u (0→1) からカメラ姿勢を設定して 1 フレーム描画する
+function applyMovieCameraPose(u, center) {
+  sph.theta = center.theta + (u - 0.5) * 2 * MOVIE_SWEEP;          // -90°→+90°
+  const pitch = MOVIE_PITCH_MIN + (MOVIE_PITCH_MAX - MOVIE_PITCH_MIN) * Math.sin(u * Math.PI); // 20→45→20
+  sph.phi = Math.PI / 2 - pitch;                                    // phi = 90° - pitch
+  sph.r = center.r;
+  updateCamera3D();
+  renderer3d.render(scene3d, camera3d);
+}
+
+// WebM 録画が使えるか (Chrome/Edge=true, Safari=false)
+function canRecordWebM() {
+  return (typeof MediaRecorder !== 'undefined')
+    && typeof HTMLCanvasElement.prototype.captureStream === 'function'
+    && (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
+        || MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
+        || MediaRecorder.isTypeSupported('video/webm'));
+}
+
+async function exportNoseInCircleMovie() {
+  if (isRecordingMovie) return;
+  if (!allPts.length) { alert('フライトデータを読み込んでください'); return; }
+  if (currentView !== '3d' && currentView !== 'terrain') { alert('3D または 地形3D ビューで実行してください'); return; }
+  if (!renderer3d || !scene3d || !camera3d) { alert('3Dシーンが未初期化です'); return; }
+
+  const btn = document.getElementById('btn-export-movie');
+  const center = { theta: sph.theta, phi: sph.phi, r: sph.r };  // 現在視点を中心に
+  const savedTarget = target3d.clone();
+  const baseName = files.length ? files[0].name.replace(/\.srt$/i, '') : 'flight';
+
+  isRecordingMovie = true;
+  btn.disabled = true;
+
+  try {
+    if (canRecordWebM()) {
+      // ===== Chrome/Edge: MediaRecorder で WebM =====
+      btn.textContent = '⏺ 録画中...';
+      const canvas = renderer3d.domElement;
+      const stream = canvas.captureStream(MOVIE_FPS);
+      let mime = 'video/webm;codecs=vp9';
+      if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
+      if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+      const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      const done = new Promise(res => { recorder.onstop = res; });
+
+      recorder.start();
+      const t0 = performance.now();
+      await new Promise(resolve => {
+        function frame(now) {
+          const u = Math.min(1, (now - t0) / MOVIE_DURATION);
+          applyMovieCameraPose(u, center);
+          if (u < 1) requestAnimationFrame(frame);
+          else resolve();
+        }
+        requestAnimationFrame(frame);
+      });
+      recorder.stop();
+      await done;
+
+      const blob = new Blob(chunks, { type: 'video/webm' });
+      downloadBlob(blob, baseName + '_noseincircle.webm');
+
+    } else {
+      // ===== Safari: 連番 PNG → ZIP =====
+      if (typeof JSZip === 'undefined') { alert('ZIPライブラリの読み込みに失敗しました。通信環境をご確認ください。'); return; }
+      const totalFrames = Math.round(MOVIE_DURATION / 1000 * MOVIE_FPS);  // 150枚
+      const zip = new JSZip();
+      const folder = zip.folder(baseName + '_frames');
+
+      for (let i = 0; i < totalFrames; i++) {
+        const u = totalFrames > 1 ? i / (totalFrames - 1) : 0;
+        applyMovieCameraPose(u, center);
+        // canvas → PNG (dataURL → base64 部分を取り出す)
+        const dataUrl = renderer3d.domElement.toDataURL('image/png');
+        const b64 = dataUrl.split(',')[1];
+        const seq = String(i).padStart(4, '0');
+        folder.file(`frame_${seq}.png`, b64, { base64: true });
+        btn.textContent = `🖼 ${i+1}/${totalFrames}`;
+        // UI を固めないよう毎フレーム描画ループに制御を返す
+        await new Promise(r => requestAnimationFrame(r));
+      }
+      btn.textContent = '📦 ZIP生成中...';
+      const blob = await zip.generateAsync({ type: 'blob' });
+      downloadBlob(blob, baseName + '_noseincircle_frames.zip');
+      // Safari 向けの案内 (連番PNGの動画化方法)
+      setTimeout(() => alert(
+        '連番PNG（' + totalFrames + '枚 / ' + MOVIE_FPS + 'fps）をZIPで保存しました。\n\n' +
+        '動画化の例:\n' +
+        '・ffmpeg: ffmpeg -framerate ' + MOVIE_FPS + ' -i frame_%04d.png -c:v libx264 -pix_fmt yuv420p out.mp4\n' +
+        '・各種動画編集ソフトの「画像シーケンス読み込み」'
+      ), 300);
+    }
+  } catch (err) {
+    console.error(err);
+    alert('動画書き出しエラー: ' + err.message);
+  } finally {
+    // カメラを元の視点へ復元
+    sph.theta = center.theta; sph.phi = center.phi; sph.r = center.r;
+    target3d.copy(savedTarget);
+    updateCamera3D();
+    isRecordingMovie = false;
+    btn.textContent = '🎬 動画'; btn.disabled = false;
+  }
+}
+
+// Blob を指定ファイル名でダウンロード
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+document.getElementById('btn-export-movie').onclick = exportNoseInCircleMovie;
 
 // 3Dマウス操作
 const va = document.getElementById('view-area');
@@ -1930,6 +2085,7 @@ document.getElementById('altScale').oninput = function() { document.getElementBy
 document.getElementById('zoomSpeed').oninput = function() { document.getElementById('zoomSpeedVal').textContent = this.value; saveSettings(); };
 document.getElementById('markerSize').oninput = function() { document.getElementById('markerSizeVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('pointSize').oninput = function() { document.getElementById('pointSizeVal').textContent = this.value + 'x'; applySettings(); };
+document.getElementById('lightScale').oninput = function() { document.getElementById('lightScaleVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('showShadow').onchange = applySettings;
 document.getElementById('alwaysOnTop').onchange = applySettings;
 document.getElementById('colorLow').oninput = applySettings;

@@ -1480,7 +1480,7 @@ function updateCamera3D() {
 
 // ============================================================
 //  ノーズインサークル動画書き出し (5秒)
-//   - 手動で選んだ現在の視点を中心に方位を -90°→+90° スイープ (180°円弧)
+//   - 手動で選んだ現在の視点を中心に方位を -45°→+45° スイープ (90°円弧)
 //   - ピッチ角 20°→45°→20° (中間で最も俯瞰し立体感を出す)
 //   - 距離 sph.r / 注視点 target3d は現在値を維持
 //
@@ -1506,17 +1506,19 @@ function applyMovieCameraPose(u, center) {
 }
 
 // MediaRecorder で録画可能な動画フォーマットを選ぶ
-//   Chrome/Edge → WebM (VP9/VP8)、Safari → MP4 (H.264)
-//   いずれも対応しなければ null (PNG連番フォールバックへ)
+//   ※ Safari は WebM を isTypeSupported で true と誤申告するが実際には出力できない。
+//     一方 MP4 は codecs=avc1 が正しい指定 (h264 という綴りは false になる)。
+//     そこで MP4(avc1) を先頭に試し、Safari では確実に MP4 を選ばせる。
+//     Chrome/Edge は MP4・WebM 両対応なので MP4 を選んでも再生に支障なし。
 function pickRecorderMime() {
   if (typeof MediaRecorder === 'undefined'
       || typeof HTMLCanvasElement.prototype.captureStream !== 'function') return null;
   const candidates = [
-    'video/webm;codecs=vp9',
+    'video/mp4;codecs=avc1',   // Safari / Chrome (H.264)
+    'video/mp4',               // MP4 フォールバック
+    'video/webm;codecs=vp9',   // Chrome/Edge
     'video/webm;codecs=vp8',
     'video/webm',
-    'video/mp4;codecs=h264',   // Safari
-    'video/mp4',               // Safari (フォールバック)
   ];
   for (const m of candidates) {
     if (MediaRecorder.isTypeSupported(m)) return m;

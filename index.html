@@ -1505,13 +1505,23 @@ function applyMovieCameraPose(u, center) {
   renderer3d.render(scene3d, camera3d);
 }
 
-// WebM 録画が使えるか (Chrome/Edge=true, Safari=false)
-function canRecordWebM() {
-  return (typeof MediaRecorder !== 'undefined')
-    && typeof HTMLCanvasElement.prototype.captureStream === 'function'
-    && (MediaRecorder.isTypeSupported('video/webm;codecs=vp9')
-        || MediaRecorder.isTypeSupported('video/webm;codecs=vp8')
-        || MediaRecorder.isTypeSupported('video/webm'));
+// MediaRecorder で録画可能な動画フォーマットを選ぶ
+//   Chrome/Edge → WebM (VP9/VP8)、Safari → MP4 (H.264)
+//   いずれも対応しなければ null (PNG連番フォールバックへ)
+function pickRecorderMime() {
+  if (typeof MediaRecorder === 'undefined'
+      || typeof HTMLCanvasElement.prototype.captureStream !== 'function') return null;
+  const candidates = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+    'video/mp4;codecs=h264',   // Safari
+    'video/mp4',               // Safari (フォールバック)
+  ];
+  for (const m of candidates) {
+    if (MediaRecorder.isTypeSupported(m)) return m;
+  }
+  return null;
 }
 
 async function exportNoseInCircleMovie() {
@@ -1528,16 +1538,16 @@ async function exportNoseInCircleMovie() {
   isRecordingMovie = true;
   btn.disabled = true;
 
+  const recMime = pickRecorderMime();
+
   try {
-    if (canRecordWebM()) {
-      // ===== Chrome/Edge: MediaRecorder で WebM =====
+    if (recMime) {
+      // ===== MediaRecorder で録画 (Chrome/Edge=WebM, Safari=MP4) =====
       btn.textContent = '⏺ 録画中...';
+      const ext = recMime.startsWith('video/mp4') ? 'mp4' : 'webm';
       const canvas = renderer3d.domElement;
       const stream = canvas.captureStream(MOVIE_FPS);
-      let mime = 'video/webm;codecs=vp9';
-      if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
-      if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
-      const recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+      const recorder = new MediaRecorder(stream, { mimeType: recMime, videoBitsPerSecond: 8_000_000 });
       const chunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
       const done = new Promise(res => { recorder.onstop = res; });
@@ -1556,11 +1566,11 @@ async function exportNoseInCircleMovie() {
       recorder.stop();
       await done;
 
-      const blob = new Blob(chunks, { type: 'video/webm' });
-      downloadBlob(blob, baseName + '_noseincircle.webm');
+      const blob = new Blob(chunks, { type: recMime });
+      downloadBlob(blob, baseName + '_noseincircle.' + ext);
 
     } else {
-      // ===== Safari: 連番 PNG → ZIP =====
+      // ===== フォールバック: 連番 PNG → ZIP (MediaRecorder 非対応環境) =====
       if (typeof JSZip === 'undefined') { alert('ZIPライブラリの読み込みに失敗しました。通信環境をご確認ください。'); return; }
       const totalFrames = Math.round(MOVIE_DURATION / 1000 * MOVIE_FPS);  // 150枚
       const zip = new JSZip();

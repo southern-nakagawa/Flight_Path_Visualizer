@@ -1459,6 +1459,7 @@ async function render3D(resetView) {
   const loop = () => {
     if (!scene3d || !camera3d) return;
     animId3d = requestAnimationFrame(loop);
+    if (isRecordingMovie) return;   // 録画中は exportNoseInCircleMovie 側が描画を担当
     renderer3d.render(scene3d, camera3d);
   };
   loop();
@@ -1480,7 +1481,7 @@ function updateCamera3D() {
 
 // ============================================================
 //  ノーズインサークル動画書き出し (5秒)
-//   - 手動で選んだ現在の視点を中心に方位を -45°→+45° スイープ (90°円弧)
+//   - 手動で選んだ現在の視点を中心に方位を -90°→+90° スイープ (180°円弧)
 //   - ピッチ角 20°→45°→20° (中間で最も俯瞰し立体感を出す)
 //   - 距離 sph.r / 注視点 target3d は現在値を維持
 //
@@ -1491,7 +1492,7 @@ function updateCamera3D() {
 let isRecordingMovie = false;
 const MOVIE_DURATION = 5000;   // 5秒
 const MOVIE_FPS = 30;
-const MOVIE_SWEEP = Math.PI / 4;                 // ±45°
+const MOVIE_SWEEP = Math.PI / 2;                 // ±90°
 const MOVIE_PITCH_MIN = 20 * Math.PI / 180;
 const MOVIE_PITCH_MAX = 45 * Math.PI / 180;
 
@@ -1537,19 +1538,55 @@ async function exportNoseInCircleMovie() {
   const savedTarget = target3d.clone();
   const baseName = files.length ? files[0].name.replace(/\.srt$/i, '') : 'flight';
 
+  // ===== 1080p 16:9 録画用に canvas を一時リサイズ =====
+  const OUT_W = 1920, OUT_H = 1080;
+  const va = document.getElementById('view-area');
+  // 元のサイズ・カメラを保存して後で復元
+  const savedW = renderer3d.domElement.width;
+  const savedH = renderer3d.domElement.height;
+  const savedAspect = camera3d.aspect;
+  const savedPixelRatio = renderer3d.getPixelRatio();
+
+  // クレジット文字列
+  const creditText = TILE_LAYERS[currentLayer].credit;
+
   isRecordingMovie = true;
   btn.disabled = true;
-
   const recMime = pickRecorderMime();
 
   try {
+    // レンダラーを 1920x1080 にセット (16:9)
+    renderer3d.setPixelRatio(1);
+    renderer3d.setSize(OUT_W, OUT_H, false);  // false: CSSサイズは変えずバッファのみ変更
+    camera3d.aspect = OUT_W / OUT_H;
+    camera3d.updateProjectionMatrix();
+
+    // 合成用 2D キャンバス (WebGL描画 + クレジットを焼き込む対象)
+    const compCanvas = document.createElement('canvas');
+    compCanvas.width = OUT_W; compCanvas.height = OUT_H;
+    const cctx = compCanvas.getContext('2d');
+
+    // クレジットを compCanvas に描く (画面の map-credit と同じ右下表示)
+    function drawCredit() {
+      cctx.font = '20px "Noto Sans JP", sans-serif';
+      cctx.textAlign = 'right';
+      cctx.textBaseline = 'bottom';
+      const pad = 10, mx = 24, my = 24;
+      const tw = cctx.measureText(creditText).width;
+      const boxW = tw + pad * 2, boxH = 30;
+      const bx = OUT_W - mx - boxW, by = OUT_H - my - boxH;
+      cctx.fillStyle = 'rgba(0,0,0,0.45)';
+      cctx.fillRect(bx, by, boxW, boxH);
+      cctx.fillStyle = 'rgba(255,255,255,0.85)';
+      cctx.fillText(creditText, OUT_W - mx - pad, OUT_H - my - 6);
+    }
+
     if (recMime) {
-      // ===== MediaRecorder で録画 (Chrome/Edge=WebM, Safari=MP4) =====
+      // ===== MediaRecorder で 1080p 録画 =====
       btn.textContent = '⏺ 録画中...';
       const ext = recMime.startsWith('video/mp4') ? 'mp4' : 'webm';
-      const canvas = renderer3d.domElement;
-      const stream = canvas.captureStream(MOVIE_FPS);
-      const recorder = new MediaRecorder(stream, { mimeType: recMime, videoBitsPerSecond: 8_000_000 });
+      const stream = compCanvas.captureStream(MOVIE_FPS);
+      const recorder = new MediaRecorder(stream, { mimeType: recMime, videoBitsPerSecond: 12_000_000 });
       const chunks = [];
       recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
       const done = new Promise(res => { recorder.onstop = res; });
@@ -1559,7 +1596,9 @@ async function exportNoseInCircleMovie() {
       await new Promise(resolve => {
         function frame(now) {
           const u = Math.min(1, (now - t0) / MOVIE_DURATION);
-          applyMovieCameraPose(u, center);
+          applyMovieCameraPose(u, center);            // WebGL を 1920x1080 で描画
+          cctx.drawImage(renderer3d.domElement, 0, 0, OUT_W, OUT_H);  // WebGL → 合成キャンバス
+          drawCredit();                               // クレジット焼き込み
           if (u < 1) requestAnimationFrame(frame);
           else resolve();
         }
@@ -1569,42 +1608,50 @@ async function exportNoseInCircleMovie() {
       await done;
 
       const blob = new Blob(chunks, { type: recMime });
-      downloadBlob(blob, baseName + '_noseincircle.' + ext);
+      btn.textContent = '🎬 動画';
+      if (confirm('1080p 16:9 のクリップ（5秒・' + ext.toUpperCase() + '）を生成しました。\nダウンロードしますか？')) {
+        downloadBlob(blob, baseName + '_noseincircle.' + ext);
+      }
 
     } else {
-      // ===== フォールバック: 連番 PNG → ZIP (MediaRecorder 非対応環境) =====
+      // ===== フォールバック: 連番 PNG → ZIP (1080p) =====
       if (typeof JSZip === 'undefined') { alert('ZIPライブラリの読み込みに失敗しました。通信環境をご確認ください。'); return; }
-      const totalFrames = Math.round(MOVIE_DURATION / 1000 * MOVIE_FPS);  // 150枚
+      const totalFrames = Math.round(MOVIE_DURATION / 1000 * MOVIE_FPS);
       const zip = new JSZip();
       const folder = zip.folder(baseName + '_frames');
-
       for (let i = 0; i < totalFrames; i++) {
         const u = totalFrames > 1 ? i / (totalFrames - 1) : 0;
         applyMovieCameraPose(u, center);
-        // canvas → PNG (dataURL → base64 部分を取り出す)
-        const dataUrl = renderer3d.domElement.toDataURL('image/png');
-        const b64 = dataUrl.split(',')[1];
-        const seq = String(i).padStart(4, '0');
-        folder.file(`frame_${seq}.png`, b64, { base64: true });
+        cctx.drawImage(renderer3d.domElement, 0, 0, OUT_W, OUT_H);
+        drawCredit();
+        const b64 = compCanvas.toDataURL('image/png').split(',')[1];
+        folder.file(`frame_${String(i).padStart(4,'0')}.png`, b64, { base64: true });
         btn.textContent = `🖼 ${i+1}/${totalFrames}`;
-        // UI を固めないよう毎フレーム描画ループに制御を返す
         await new Promise(r => requestAnimationFrame(r));
       }
       btn.textContent = '📦 ZIP生成中...';
       const blob = await zip.generateAsync({ type: 'blob' });
-      downloadBlob(blob, baseName + '_noseincircle_frames.zip');
-      // Safari 向けの案内 (連番PNGの動画化方法)
-      setTimeout(() => alert(
-        '連番PNG（' + totalFrames + '枚 / ' + MOVIE_FPS + 'fps）をZIPで保存しました。\n\n' +
-        '動画化の例:\n' +
-        '・ffmpeg: ffmpeg -framerate ' + MOVIE_FPS + ' -i frame_%04d.png -c:v libx264 -pix_fmt yuv420p out.mp4\n' +
-        '・各種動画編集ソフトの「画像シーケンス読み込み」'
-      ), 300);
+      btn.textContent = '🎬 動画';
+      if (confirm('1080p 連番PNG（' + totalFrames + '枚）を生成しました。\nダウンロードしますか？')) {
+        downloadBlob(blob, baseName + '_noseincircle_frames.zip');
+        setTimeout(() => alert(
+          '動画化の例:\n' +
+          '・ffmpeg: ffmpeg -framerate ' + MOVIE_FPS + ' -i frame_%04d.png -c:v libx264 -pix_fmt yuv420p out.mp4\n' +
+          '・各種動画編集ソフトの「画像シーケンス読み込み」'
+        ), 300);
+      }
     }
   } catch (err) {
     console.error(err);
     alert('動画書き出しエラー: ' + err.message);
   } finally {
+    // レンダラー・カメラを元のサイズへ復元
+    renderer3d.setPixelRatio(savedPixelRatio);
+    const el = document.getElementById('view-3d');
+    const W = el.clientWidth, H = el.clientHeight;
+    renderer3d.setSize(W, H);
+    camera3d.aspect = W / H;
+    camera3d.updateProjectionMatrix();
     // カメラを元の視点へ復元
     sph.theta = center.theta; sph.phi = center.phi; sph.r = center.r;
     target3d.copy(savedTarget);

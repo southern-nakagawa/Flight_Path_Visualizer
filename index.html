@@ -353,6 +353,25 @@ body { background: var(--bg); color: var(--text); font-family: 'Noto Sans JP', s
         <input type="range" id="lightScale" min="0.3" max="1.5" step="0.05" value="1.0">
         <span class="ctrl-val" id="lightScaleVal">1.0x</span>
       </div>
+      <!-- 動画カメラワーク設定 -->
+      <div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border);">
+        <div style="font-size:11px;color:var(--accent);letter-spacing:1px;margin-bottom:8px;">🎬 動画カメラワーク</div>
+        <div class="ctrl-row" title="ノーズインサークルの左右の振り幅。中心視点から左右に何度スイープするか。">
+          <span class="ctrl-label">左右振り幅</span>
+          <input type="range" id="movSweep" min="0" max="90" step="5" value="90">
+          <span class="ctrl-val" id="movSweepVal">±90°</span>
+        </div>
+        <div class="ctrl-row" title="俯瞰角(ピッチ)の最小値。動画の始点・終点の角度。">
+          <span class="ctrl-label">上下角 最小</span>
+          <input type="range" id="movPitchMin" min="10" max="45" step="1" value="20">
+          <span class="ctrl-val" id="movPitchMinVal">20°</span>
+        </div>
+        <div class="ctrl-row" title="俯瞰角(ピッチ)の最大値。動画の中間で最も見下ろす角度。">
+          <span class="ctrl-label">上下角 最大</span>
+          <input type="range" id="movPitchMax" min="20" max="60" step="1" value="45">
+          <span class="ctrl-val" id="movPitchMaxVal">45°</span>
+        </div>
+      </div>
       <!-- 影表示 -->
       <div style="margin:10px 0;">
         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:12px;">
@@ -1117,6 +1136,9 @@ function saveSettings() {
     markerSize: document.getElementById('markerSize').value,
     pointSize: document.getElementById('pointSize').value,
     lightScale: document.getElementById('lightScale').value,
+    movSweep: document.getElementById('movSweep').value,
+    movPitchMin: document.getElementById('movPitchMin').value,
+    movPitchMax: document.getElementById('movPitchMax').value,
     showShadow: document.getElementById('showShadow').checked,
     alwaysOnTop: document.getElementById('alwaysOnTop').checked,
     colorMode: document.querySelector('input[name="colorMode"]:checked').value,
@@ -1137,6 +1159,9 @@ function loadSettings() {
     if (d.markerSize) { document.getElementById('markerSize').value = d.markerSize; document.getElementById('markerSizeVal').textContent = d.markerSize + 'x'; }
     if (d.pointSize)  { document.getElementById('pointSize').value = d.pointSize; document.getElementById('pointSizeVal').textContent = d.pointSize + 'x'; }
     if (d.lightScale) { document.getElementById('lightScale').value = d.lightScale; document.getElementById('lightScaleVal').textContent = d.lightScale + 'x'; }
+    if (d.movSweep)    { document.getElementById('movSweep').value = d.movSweep; document.getElementById('movSweepVal').textContent = '±' + d.movSweep + '°'; }
+    if (d.movPitchMin) { document.getElementById('movPitchMin').value = d.movPitchMin; document.getElementById('movPitchMinVal').textContent = d.movPitchMin + '°'; }
+    if (d.movPitchMax) { document.getElementById('movPitchMax').value = d.movPitchMax; document.getElementById('movPitchMaxVal').textContent = d.movPitchMax + '°'; }
     if (d.showShadow !== undefined) document.getElementById('showShadow').checked = d.showShadow;
     if (d.alwaysOnTop !== undefined) document.getElementById('alwaysOnTop').checked = d.alwaysOnTop;
     if (d.colorMode) { document.querySelector(`input[name="colorMode"][value="${d.colorMode}"]`).checked = true; }
@@ -1492,14 +1517,15 @@ function updateCamera3D() {
 let isRecordingMovie = false;
 const MOVIE_DURATION = 5000;   // 5秒
 const MOVIE_FPS = 30;
-const MOVIE_SWEEP = Math.PI / 2;                 // ±90°
-const MOVIE_PITCH_MIN = 20 * Math.PI / 180;
-const MOVIE_PITCH_MAX = 45 * Math.PI / 180;
 
 // 進行度 u (0→1) からカメラ姿勢を設定して 1 フレーム描画する
+//   左右振り幅・上下角(最小/最大) は表示設定スライダーから取得 (度→ラジアン)
 function applyMovieCameraPose(u, center) {
-  sph.theta = center.theta + (u - 0.5) * 2 * MOVIE_SWEEP;          // -90°→+90°
-  const pitch = MOVIE_PITCH_MIN + (MOVIE_PITCH_MAX - MOVIE_PITCH_MIN) * Math.sin(u * Math.PI); // 20→45→20
+  const sweep    = (parseFloat(document.getElementById('movSweep').value)    || 90) * Math.PI / 180;
+  const pitchMin = (parseFloat(document.getElementById('movPitchMin').value) || 20) * Math.PI / 180;
+  const pitchMax = (parseFloat(document.getElementById('movPitchMax').value) || 45) * Math.PI / 180;
+  sph.theta = center.theta + (u - 0.5) * 2 * sweep;                 // -sweep→+sweep
+  const pitch = pitchMin + (pitchMax - pitchMin) * Math.sin(u * Math.PI);  // min→max→min
   sph.phi = Math.PI / 2 - pitch;                                    // phi = 90° - pitch
   sph.r = center.r;
   updateCamera3D();
@@ -1568,17 +1594,17 @@ async function exportNoseInCircleMovie() {
 
     // クレジットを compCanvas に描く (画面の map-credit と同じ右下表示)
     function drawCredit() {
-      cctx.font = '20px "Noto Sans JP", sans-serif';
+      cctx.font = '14px "Noto Sans JP", sans-serif';
       cctx.textAlign = 'right';
       cctx.textBaseline = 'bottom';
-      const pad = 10, mx = 24, my = 24;
+      const pad = 7, mx = 20, my = 20;
       const tw = cctx.measureText(creditText).width;
-      const boxW = tw + pad * 2, boxH = 30;
+      const boxW = tw + pad * 2, boxH = 22;
       const bx = OUT_W - mx - boxW, by = OUT_H - my - boxH;
       cctx.fillStyle = 'rgba(0,0,0,0.45)';
       cctx.fillRect(bx, by, boxW, boxH);
       cctx.fillStyle = 'rgba(255,255,255,0.85)';
-      cctx.fillText(creditText, OUT_W - mx - pad, OUT_H - my - 6);
+      cctx.fillText(creditText, OUT_W - mx - pad, OUT_H - my - 5);
     }
 
     if (recMime) {
@@ -2145,6 +2171,31 @@ document.getElementById('zoomSpeed').oninput = function() { document.getElementB
 document.getElementById('markerSize').oninput = function() { document.getElementById('markerSizeVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('pointSize').oninput = function() { document.getElementById('pointSizeVal').textContent = this.value + 'x'; applySettings(); };
 document.getElementById('lightScale').oninput = function() { document.getElementById('lightScaleVal').textContent = this.value + 'x'; applySettings(); };
+// 動画カメラワーク スライダー (値表示のみ更新。録画時に読み取る)
+document.getElementById('movSweep').oninput = function() {
+  document.getElementById('movSweepVal').textContent = '±' + this.value + '°';
+  saveSettings();
+};
+const movPitchMinEl = document.getElementById('movPitchMin');
+const movPitchMaxEl = document.getElementById('movPitchMax');
+movPitchMinEl.oninput = function() {
+  // 最小 ≤ 最大 を保証: 最小を上げて最大を超えたら最大も押し上げる
+  if (parseFloat(this.value) > parseFloat(movPitchMaxEl.value)) {
+    movPitchMaxEl.value = this.value;
+    document.getElementById('movPitchMaxVal').textContent = movPitchMaxEl.value + '°';
+  }
+  document.getElementById('movPitchMinVal').textContent = this.value + '°';
+  saveSettings();
+};
+movPitchMaxEl.oninput = function() {
+  // 最大 ≥ 最小 を保証: 最大を下げて最小を下回ったら最小も押し下げる
+  if (parseFloat(this.value) < parseFloat(movPitchMinEl.value)) {
+    movPitchMinEl.value = this.value;
+    document.getElementById('movPitchMinVal').textContent = movPitchMinEl.value + '°';
+  }
+  document.getElementById('movPitchMaxVal').textContent = this.value + '°';
+  saveSettings();
+};
 document.getElementById('showShadow').onchange = applySettings;
 document.getElementById('alwaysOnTop').onchange = applySettings;
 document.getElementById('colorLow').oninput = applySettings;

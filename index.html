@@ -859,7 +859,7 @@ function renderFlightTable(list) {
           📅 ${dateTimeStr} &nbsp;⏱ ${fmtDur(Math.round(f._dur))} &nbsp;↑ ${f._maxAlt.toFixed(0)}m &nbsp;🛤 ${distStr}
         </div>
         <div style="font-size:10px;margin-top:2px;line-height:1.7;">${evHtml}</div>
-        <div class="elev-offset-row" style="display:flex;align-items:center;gap:5px;font-size:10px;margin-top:3px;color:var(--text2);" title="地形3Dビュー時、ファイル先頭フレーム (録画開始点) の標高を ±m で補正します。岩場・橋・屋上など DEM 解像度では表現できない地形や、空中で録画開始した場合に有効。">
+        <div class="elev-offset-row" style="display:flex;align-items:center;gap:5px;font-size:10px;margin-top:3px;color:var(--text2);" title="地形3Dビュー時の高さ補正 (±m)。基準 = 録画開始点の直下地表標高 + rel_alt。録画開始点の地表標高と実際の離陸点の地表標高が違う場合 (斜面など)、その差を入力して補正します。">
           🗻 標高補正
           <input type="number" data-offset-id="${f.id}" step="0.5" value="${(f.elevOffset||0).toFixed(1)}"
             style="width:55px;background:var(--panel);border:1px solid var(--border);border-radius:3px;color:var(--accent2);padding:1px 4px;font-family:Rajdhani,sans-serif;font-size:11px;text-align:right;">
@@ -1224,14 +1224,15 @@ async function render3D(resetView) {
 
   // ライティングは span (地図サイズ) 確定後に設定する → 後述
 
-  // ===== ファイル毎の離陸地点標高を確定 (DEM プリロード済みなので即時) =====
-  //   モード3 (snap-to-terrain, デフォルト):
-  //     離陸点 (時系列最初の点) を DEM 表面にぴったり貼り付ける
-  //     autoBase = DEM(takeoff_lon, takeoff_lat) - takeoff.rel_alt
-  //   モード1 (manual offset):
-  //     f.elevOffset で ±m 補正 (岩場・橋・屋上など、DEM 解像度 10m格子では
-  //     表現できない離陸面の高さズレを吸収する)
-  //   最終: baseElev = autoBase + offset
+  // ===== ファイル毎の基準標高を確定 (DEM プリロード済みなので即時) =====
+  //   DJI SRT の rel_alt は「離陸地点(ホームポイント)からの相対高度」。
+  //   録画開始点 (フレーム0) は離陸地点とは限らない (上昇後に録画開始する場合あり)。
+  //   離陸地点の緯度経度は SRT に無いため、録画開始点の直下地表標高で近似する:
+  //     飛行点の絶対標高 = DEM(録画開始点) + rel_alt + 手動オフセット
+  //   手動オフセット (f.elevOffset):
+  //     「録画開始点の地表標高」と「実際の離陸点の地表標高」の差を入力して補正する。
+  //     斜面など、録画開始点直下と離陸地点で地表高が違うケースを吸収する。
+  //   baseElev = DEM(録画開始点) + offset  ／  飛行点Y = (baseElev + rel_alt) × altScale
   const baseElevByFile = new Map();
   let globalBaseElev = 0;
   let globalAutoBase = 0;
@@ -1240,9 +1241,8 @@ async function render3D(resetView) {
     files.forEach(f => {
       const fpts = allPts.filter(p => p.fileId === f.id);
       if (!fpts.length) { baseElevByFile.set(f.id, 0); return; }
-      const takeoff = fpts[0];  // 時系列最初の点 = 離陸点
-      const demAtTakeoff = sampleElevation(takeoff.lon, takeoff.lat);
-      const autoBase = demAtTakeoff - takeoff.alt;
+      const recStart = fpts[0];  // 録画開始点 (時系列最初の点)
+      const autoBase = sampleElevation(recStart.lon, recStart.lat);  // 録画開始点直下の地表標高
       const offset = f.elevOffset || 0;
       baseElevByFile.set(f.id, autoBase + offset);
       if (f === files[0]) { globalAutoBase = autoBase; globalOffset = offset; }
@@ -1250,7 +1250,7 @@ async function render3D(resetView) {
     if (files.length) globalBaseElev = baseElevByFile.get(files[0].id) || 0;
   }
   const baseElevOf = (fileId) => terrainMode ? (baseElevByFile.get(fileId) || 0) : 0;
-  // 飛行経路点 Y: フラット=alt*altScale、地形=(baseElev+alt)*altScale
+  // 飛行経路点 Y: フラット=alt*altScale、地形=(baseElev+rel_alt)*altScale
   const yOfPoint = (p, fileId) => (baseElevOf(fileId) + p.alt) * s.altScale;
   // 影/地面トレース Y: フラット=0.15固定、地形=その地点の地表標高*altScale+オフセット
   const groundY = (lon, lat) => terrainMode ? sampleElevation(lon, lat) * s.altScale + 0.15 : 0.15;
@@ -2017,13 +2017,13 @@ function updateTerrainInfoPanel(altScale, baseElev, terrainMin, terrainMax, auto
   const droneMSL_max = baseElev + maxRel;
   // オフセット表示: 補正がかかっているときだけ強調表示
   const offsetTxt = (offset && Math.abs(offset) > 0.01)
-    ? ` <span style="color:var(--amber)">(自動 ${autoBase.toFixed(1)} ${offset>=0?'+':'−'} ${Math.abs(offset).toFixed(1)})</span>`
+    ? ` <span style="color:var(--amber)">(地表 ${autoBase.toFixed(1)} ${offset>=0?'+':'−'} ${Math.abs(offset).toFixed(1)})</span>`
     : '';
   document.getElementById('terrain-elev-detail').innerHTML =
-    `<span style="color:var(--accent2)">録画開始地点標高 ${baseElev.toFixed(1)} m MSL</span>${offsetTxt}` +
+    `<span style="color:var(--accent2)">基準標高 ${baseElev.toFixed(1)} m MSL</span>${offsetTxt}` +
     `<span style="color:var(--text2)"> ｜ 地形誇張率 ${altScale}x</span><br>` +
     `<span style="color:var(--text2)">地形範囲 ${terrainMin.toFixed(0)}〜${terrainMax.toFixed(0)} m MSL</span><br>` +
-    `<span style="color:var(--text2)">ドローン最高 ${droneMSL_max.toFixed(1)} m MSL (${maxRel.toFixed(1)} m AGL)</span>`;
+    `<span style="color:var(--text2)">ドローン最高 ${droneMSL_max.toFixed(1)} m MSL (離陸点比 ${maxRel.toFixed(1)} m)</span>`;
 }
 
 
